@@ -1,0 +1,31 @@
+[package]
+name = "canon-raw"
+version = "0.1.0"
+edition = "2024"
+authors = ["Adrian <adrian.eddy at gmail>"]
+description = "Rust bindings for Canon RAW SDK"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/AdrianEddy/crm-rs"
+readme = "README.md"
+keywords = ["canon", "raw", "video"]
+categories = ["video", "media-processing"]
+
+[dependencies]
+log = "0.4"
+paste = "1.0"
+libloading = "0.9"
+futures-util = "0.3"
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"], optional = true }
+bitflags = "2.10"
+
+[features]
+default = ["serde"]
+serde = ["dep:serde"]
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation","Win32_System_Com","Win32_System_Variant", "Win32_System_Ole", "Win32_System_LibraryLoader"] }
+
+[dev-dependencies]
+pollster = "0.4"
+image = { version = "0.25", features = ["png", "jpeg"] }
