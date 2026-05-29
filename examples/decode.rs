@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use canon_raw::*;
 use canon_raw::crm_parser::*;
 
@@ -19,7 +20,7 @@ fn main() -> Result<()> {
 		windows_sys::Win32::System::LibraryLoader::AddDllDirectory(wide.as_ptr());
 	}
 
-    let lib = CrmSdkLibrary::load("D:\\programowanie\\projekty\\Rust\\crm-rs\\sdk\\CRMSDK210\\CRMSDK\\Win_Lib\\x64\\CrmSdk.dll").unwrap();
+    let lib = Arc::new(CrmSdkLibrary::load("D:\\programowanie\\projekty\\Rust\\crm-rs\\sdk\\CRMSDK210\\CRMSDK\\Win_Lib\\x64\\CrmSdk.dll").unwrap());
     lib.initialize_sdk().unwrap();
 	lib.set_luts_directory("D:\\programowanie\\projekty\\Rust\\crm-rs\\sdk\\CRMSDK210\\CRMSDK\\CanonLUTs\\", true).unwrap();
 
@@ -107,7 +108,7 @@ fn main() -> Result<()> {
 		out_width * samples_per_pixel * std::mem::size_of::<i32>() as u32 / data_num_in_int
 	};
 	let dst_buffer_size = out_bytes_per_line * out_height;
-	let dst_buffer = CrmMemory::new(&lib, dst_buffer_size, device).unwrap();
+	let dst_buffer = CrmMemory::new(lib.clone(), dst_buffer_size, device).unwrap();
 
 	//Get RGB image data
 	let dst_data_size = lib.get_image(process_ref,

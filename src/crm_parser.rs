@@ -590,18 +590,72 @@ impl<R: Read + Seek> CrmMovie<R> {
         self.video_index.len() as u64
     }
 
-    /// Read a compressed video frame
+    /// Get the timed-metadata sample count (may differ from `frame_count()`
+    /// if the file's video and metadata tracks have different sample counts).
+    pub fn timed_meta_count(&self) -> u64 {
+        self.timed_meta_index.len() as u64
+    }
+
+    /// Size of the compressed video frame at `frame_no`, in bytes.
+    pub fn compressed_frame_size(&self, frame_no: u64) -> Result<u32> {
+        Self::sample_size(&self.video_index, frame_no)
+    }
+
+    /// Size of the timed-metadata sample at `frame_no`, in bytes.
+    pub fn timed_meta_size(&self, frame_no: u64) -> Result<u32> {
+        Self::sample_size(&self.timed_meta_index, frame_no)
+    }
+
+    /// Read a compressed video frame. Convenience wrapper around
+    /// [`read_compressed_frame_into`](Self::read_compressed_frame_into);
+    /// allocates a fresh `Vec<u8>` per call. For zero-allocation
+    /// per-frame decode loops prefer the `_into` variant + an owned
+    /// scratch buffer.
     pub fn read_compressed_frame(&mut self, frame_no: u64) -> Result<Vec<u8>> {
-        Self::read_sample(&mut self.reader, &self.video_index, frame_no)
+        let size = self.compressed_frame_size(frame_no)? as usize;
+        let mut buf = Vec::with_capacity(size);
+        unsafe { buf.set_len(size); }
+        let n = self.read_compressed_frame_into(frame_no, &mut buf)?;
+        buf.truncate(n);
+        Ok(buf)
     }
 
-    /// Read timed metadata for a frame
+    /// Read timed metadata for a frame. Convenience wrapper; see
+    /// [`read_compressed_frame`](Self::read_compressed_frame) for the
+    /// allocation note.
     pub fn read_timed_meta(&mut self, frame_no: u64) -> Result<Vec<u8>> {
-        Self::read_sample(&mut self.reader, &self.timed_meta_index, frame_no)
+        let size = self.timed_meta_size(frame_no)? as usize;
+        let mut buf = Vec::with_capacity(size);
+        unsafe { buf.set_len(size); }
+        let n = self.read_timed_meta_into(frame_no, &mut buf)?;
+        buf.truncate(n);
+        Ok(buf)
     }
 
-    /// Internal sample reader (no clones; borrows reader + index separately)
-    fn read_sample(reader: &mut R, index: &[IndexEntry], frame_no: u64) -> Result<Vec<u8>> {
+    /// Read the compressed video frame at `frame_no` into the caller-owned
+    /// buffer `dst`. Returns the number of bytes written (always equal to
+    /// `compressed_frame_size(frame_no)` on success). Returns
+    /// [`CrmError::BufferTooSmall`] if `dst` is shorter than the sample size.
+    pub fn read_compressed_frame_into(&mut self, frame_no: u64, dst: &mut [u8]) -> Result<usize> {
+        Self::read_sample_into(&mut self.reader, &self.video_index, frame_no, dst)
+    }
+
+    /// Read the timed-metadata sample at `frame_no` into the caller-owned
+    /// buffer `dst`. Semantics match [`read_compressed_frame_into`](Self::read_compressed_frame_into).
+    pub fn read_timed_meta_into(&mut self, frame_no: u64, dst: &mut [u8]) -> Result<usize> {
+        Self::read_sample_into(&mut self.reader, &self.timed_meta_index, frame_no, dst)
+    }
+
+    fn sample_size(index: &[IndexEntry], frame_no: u64) -> Result<u32> {
+        let count = index.len() as u64;
+        if frame_no >= count {
+            return Err(CrmError::FrameOutOfRange { index: frame_no, count });
+        }
+        Ok(index[frame_no as usize].size)
+    }
+
+    /// Internal sample reader that writes into a caller-owned buffer.
+    fn read_sample_into(reader: &mut R, index: &[IndexEntry], frame_no: u64, dst: &mut [u8]) -> Result<usize> {
         let count = index.len() as u64;
         if frame_no >= count {
             return Err(CrmError::FrameOutOfRange { index: frame_no, count });
@@ -610,13 +664,14 @@ impl<R: Read + Seek> CrmMovie<R> {
         let entry = &index[frame_no as usize];
         let size = entry.size as usize;
 
-        let mut buf = Vec::with_capacity(size);
-        unsafe { buf.set_len(size); } // buf now has `size` bytes, uninitialized
+        if dst.len() < size {
+            return Err(CrmError::BufferTooSmall { needed: size, got: dst.len() });
+        }
 
         reader.seek(SeekFrom::Start(entry.offset))?;
-        reader.read_exact(&mut buf)?;
+        reader.read_exact(&mut dst[..size])?;
 
-        Ok(buf)
+        Ok(size)
     }
 
     /// Get a reference to the CRAW entry data

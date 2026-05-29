@@ -28,7 +28,7 @@ pub enum CrmError {
     MissingData(&'static str),
 
     #[error("SDK error: {0:?}")]
-    SdkError((SdkError, String)),
+    SdkError(#[from] SdkError),
 
     #[error("Buffer too small: need {needed}, got {got}")]
     BufferTooSmall { needed: usize, got: usize },
@@ -39,6 +39,13 @@ pub enum CrmError {
     #[error("Error: {0}")]
     Other(String),
 }
+
+impl std::fmt::Display for SdkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?} (0x{:08X})", *self as u32)
+    }
+}
+impl std::error::Error for SdkError {}
 
 #[repr(u32)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
