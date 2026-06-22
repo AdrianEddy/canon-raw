@@ -617,6 +617,9 @@ pub struct CrmCudaInit {
 }
 
 #[cfg(not(target_vendor = "apple"))]
+unsafe impl Send for CrmCudaInit {}
+
+#[cfg(not(target_vendor = "apple"))]
 impl CrmCudaInit {
     /// Single-GPU shape — most common.
     pub fn new(device_id: u32, compute_stream: *mut core::ffi::c_void) -> Self {
@@ -657,13 +660,6 @@ impl std::fmt::Debug for CrmCudaInit {
     }
 }
 
-// SAFETY: holds an owned Box-allocated array of stream pointers + a
-// raw struct that points into them. The pointers are opaque CUDA
-// handles documented as thread-safe-by-handle (enqueue is thread-
-// affine but the handles themselves are movable).
-#[cfg(not(target_vendor = "apple"))]
-unsafe impl Send for CrmCudaInit {}
-
 /// Owned OpenCL init descriptor — handed to
 /// [`CrmSdkLibrary::initialize_with_opencl`].
 pub struct CrmOpenClInit {
@@ -671,6 +667,8 @@ pub struct CrmOpenClInit {
     _queues:  Box<[*mut CrmVoid]>,
     raw:      ClObject,
 }
+
+unsafe impl Send for CrmOpenClInit {}
 
 impl CrmOpenClInit {
     /// Single-device shape.
@@ -717,14 +715,15 @@ impl std::fmt::Debug for CrmOpenClInit {
     }
 }
 
-unsafe impl Send for CrmOpenClInit {}
-
 /// Owned Metal init descriptor — handed to
 /// [`CrmSdkLibrary::initialize_with_metal`]. macOS only.
 #[cfg(target_vendor = "apple")]
 pub struct CrmMetalInit {
     raw: MtlObject,
 }
+
+#[cfg(target_vendor = "apple")]
+unsafe impl Send for CrmMetalInit {}
 
 #[cfg(target_vendor = "apple")]
 impl CrmMetalInit {
@@ -750,9 +749,6 @@ impl std::fmt::Debug for CrmMetalInit {
         f.debug_struct("CrmMetalInit").finish_non_exhaustive()
     }
 }
-
-#[cfg(target_vendor = "apple")]
-unsafe impl Send for CrmMetalInit {}
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
@@ -909,12 +905,34 @@ unsafe extern "system" fn get_image_async_callback(
     SdkError::Ok
 }
 
+/// Shared `poll` body for [`GetImageFuture`] / [`OwnedGetImageFuture`]:
+/// register the waker, and on completion translate the SDK result into
+/// `Poll::Ready`. The two futures differ only in how they hold the SDK
+/// handle (`&` vs `Arc`); the completion logic is identical.
+fn poll_get_image(
+    sdk:   &CrmSdkLibrary,
+    state: &GetImageAsyncState,
+    cx:    &mut Context<'_>,
+) -> Poll<Result<GetImageAsyncOutput>> {
+    state.waker.register(cx.waker());
+    if state.done.load(Ordering::Acquire) {
+        if let Some(res) = state.result.lock().unwrap().take() {
+            if let Err(e) = sdk.err_to_result(res.error) {
+                return Poll::Ready(Err(e));
+            }
+            return Poll::Ready(Ok(GetImageAsyncOutput {
+                dst_buffer:    res.dst_buffer,
+                dst_data_size: res.dst_data_size,
+            }));
+        }
+    }
+    Poll::Pending
+}
+
 pub struct GetImageFuture<'a> {
     sdk: &'a CrmSdkLibrary,
     state: Arc<GetImageAsyncState>,
     _out_dst_data_size: Box<CrmUInt32>,
-    _out_dst_buffer: *mut CrmVoid,
-    _out_dst_buffer_size: CrmUInt32,
     _in_src_buffer: &'a [u8],
     _in_dev_param: &'a DevParamV13,
     _in_res_param: &'a ResParamV13,
@@ -926,21 +944,46 @@ impl Future for GetImageFuture<'_> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        this.state.waker.register(cx.waker());
+        poll_get_image(this.sdk, &this.state, cx)
+    }
+}
 
-        if this.state.done.load(Ordering::Acquire) {
-            if let Some(res) = this.state.result.lock().unwrap().take() {
-                if let Err(e) = this.sdk.err_to_result(res.error) {
-                    return Poll::Ready(Err(e));
-                }
-                return Poll::Ready(Ok(GetImageAsyncOutput {
-                    dst_buffer: res.dst_buffer,
-                    dst_data_size: res.dst_data_size,
-                }));
-            }
-        }
+/// `'static` owned-source variant of [`GetImageFuture`].
+///
+/// The borrowed [`GetImageFuture`] pins `&'a` references to the source /
+/// header / dev / res inputs, so it cannot be parked in a `Vec` alongside
+/// the very buffers it borrows (the self-referential-struct problem) — which
+/// is exactly what a pipelined scheduler keeping `depth` jobs in flight needs.
+/// This variant instead **owns** the dev/res param structs (which the SDK
+/// reads via raw pointer until the callback fires) plus opaque `Send`
+/// keepalives backing the source + header pointers. The output buffer is the
+/// caller's (kept alive by the caller's pipeline ticket). `Unpin`.
+///
+/// Completion is driven by the same `Arc::into_raw`/`from_raw`-co-owned
+/// [`GetImageAsyncState`] + waker as [`GetImageFuture`], so dropping a pending
+/// future is memory-safe (the SDK still owns a `State` refcount).
+pub struct OwnedGetImageFuture {
+    sdk:                Arc<CrmSdkLibrary>,
+    state:              Arc<GetImageAsyncState>,
+    _out_dst_data_size: Box<CrmUInt32>,
+    _dev_param:         Box<DevParamV13>,
+    _res_param:         Box<ResParamV13>,
+    _src_keep:          Box<dyn core::any::Any + Send>,
+    _hdr_keep:          Box<dyn core::any::Any + Send>,
+}
 
-        Poll::Pending
+// OwnedGetImageFuture — Send only. Its only non-auto-`Send` members are
+// the `Arc`-wrapped SDK handle and the opaque `Send`-bounded keepalives;
+// the future holds no raw output pointer (the caller's ticket owns that).
+// Single-owner per decoder, matching the `CrmSdkLibrary` Send contract.
+unsafe impl Send for OwnedGetImageFuture {}
+
+impl Future for OwnedGetImageFuture {
+    type Output = Result<GetImageAsyncOutput>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        poll_get_image(&this.sdk, &this.state, cx)
     }
 }
 
@@ -1216,6 +1259,14 @@ pub struct CrmSdkLibrary {
     // must be last
     lib: dl::Library,
 }
+
+// CrmSdkLibrary — Send + Sync. Holds a refcounted `libloading::Library`
+// handle plus resolved (stateless) function pointers; no apartment-model
+// thread affinity. Concurrent `&self` access hits SDK functions the
+// vendor documents as thread-safe for the init/allocate/decode/release
+// surface.
+unsafe impl Send for CrmSdkLibrary {}
+unsafe impl Sync for CrmSdkLibrary {}
 
 impl CrmSdkLibrary {
     pub fn load<P: libloading::AsFilename>(path: P) -> std::result::Result<Self, libloading::Error> {
@@ -1507,6 +1558,64 @@ impl CrmSdkLibrary {
         Ok(token)
     }
 
+    /// Core `CrmGetImageAsync` submission shared by the borrowed
+    /// ([`get_image_future`](Self::get_image_future)) and owned
+    /// ([`get_image_future_owned`](Self::get_image_future_owned))
+    /// builders: performs the `Arc::into_raw` co-ownership handoff to the
+    /// SDK and reclaims the refcount if submission fails, returning the
+    /// live [`GetImageAsyncState`] on success.
+    ///
+    /// # Safety
+    /// Every pointer must stay valid until the returned state's callback
+    /// fires; the caller owns keeping the backing allocations alive (via
+    /// the future's keepalive fields).
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn submit_get_image_async(
+        &self,
+        in_process_ref:       ProcessRef,
+        out_dst_buffer:       *mut CrmVoid,
+        in_dst_buffer_size:   CrmUInt32,
+        out_dst_data_size:    *mut CrmUInt32,
+        in_bits_per_sample:   CrmUInt32,
+        in_samples_per_pixel: CrmUInt32,
+        in_bytes_per_line:    CrmUInt32,
+        in_sample_sequence:   CrmUInt32,
+        src_ptr:              *mut CrmVoid,
+        src_size:             CrmUInt32,
+        dev_param:            *mut CrmVoid,
+        res_param:            *mut CrmVoid,
+        header_ptr:           *mut CrmVoid,
+        header_size:          CrmUInt32,
+    ) -> Result<Arc<GetImageAsyncState>> {
+        let state = Arc::new(GetImageAsyncState::new());
+        let ref_con = Arc::into_raw(state.clone()) as *mut CrmVoid;
+        let submit_res = self.err_to_result(unsafe {
+            (self.CrmGetImageAsync)(
+                in_process_ref,
+                out_dst_buffer,
+                in_dst_buffer_size,
+                out_dst_data_size,
+                in_bits_per_sample,
+                in_samples_per_pixel,
+                in_bytes_per_line,
+                in_sample_sequence,
+                src_ptr,
+                src_size,
+                dev_param,
+                res_param,
+                ref_con,
+                header_ptr,
+                header_size,
+                Some(get_image_async_callback),
+            )
+        });
+        if let Err(e) = submit_res {
+            unsafe { drop(Arc::from_raw(ref_con as *const GetImageAsyncState)) };
+            return Err(e);
+        }
+        Ok(state)
+    }
+
     pub fn get_image_future<'a>(
         &'a self,
         in_process_ref: ProcessRef,
@@ -1521,12 +1630,12 @@ impl CrmSdkLibrary {
         in_res_param: &'a ResParamV13,
         in_header_buffer: &'a [u8],
     ) -> Result<GetImageFuture<'a>> {
-        let state = Arc::new(GetImageAsyncState::new());
-        let ref_con = Arc::into_raw(state.clone()) as *mut CrmVoid;
         let mut out_dst_data_size = Box::new(0u32);
-
-        let submit_res = self.err_to_result(unsafe {
-            (self.CrmGetImageAsync)(
+        // SAFETY: every pointer is derived from a `&'a` borrow that
+        // outlives the returned future, so all stay valid until the
+        // callback fires.
+        let state = unsafe {
+            self.submit_get_image_async(
                 in_process_ref,
                 out_dst_buffer,
                 in_dst_buffer_size,
@@ -1539,28 +1648,89 @@ impl CrmSdkLibrary {
                 in_src_buffer.len() as CrmUInt32,
                 in_dev_param as *const _ as *mut CrmVoid,
                 in_res_param as *const _ as *mut CrmVoid,
-                ref_con,
                 in_header_buffer.as_ptr() as *mut CrmVoid,
                 in_header_buffer.len() as CrmUInt32,
-                Some(get_image_async_callback),
-            )
-        });
-
-        if let Err(e) = submit_res {
-            unsafe { drop(Arc::from_raw(ref_con as *const GetImageAsyncState)) };
-            return Err(e);
-        }
+            )?
+        };
 
         Ok(GetImageFuture {
             sdk: self,
             state,
             _out_dst_data_size: out_dst_data_size,
-            _out_dst_buffer: out_dst_buffer,
-            _out_dst_buffer_size: in_dst_buffer_size,
             _in_src_buffer: in_src_buffer,
             _in_dev_param: in_dev_param,
             _in_res_param: in_res_param,
             _in_header_buffer: in_header_buffer,
+        })
+    }
+
+    /// `'static` owned-source counterpart to [`get_image_future`](Self::get_image_future).
+    ///
+    /// Submits `CrmGetImageAsync` and returns an [`OwnedGetImageFuture`] that
+    /// borrows nothing — the dev/res param structs are moved in (boxed; the
+    /// SDK reads them via raw pointer until the callback fires), and the
+    /// source + header buffers are kept alive by the opaque `Send` keepalives
+    /// (`src_keep` / `hdr_keep`). The output buffer is the caller's. This is
+    /// what lets a pipelined scheduler park `depth` jobs in a pool.
+    ///
+    /// `in_sample_sequence` is the raw SDK code (`0` for a CRMDecompressed
+    /// Bayer output; `SampleSequence::Rgba16BitLe as u32` for a developed
+    /// RGBA16 output), matching `CrmGetImageAsync`'s untyped parameter.
+    ///
+    /// # Safety
+    /// - `src_ptr` (`src_size` bytes) and `header_ptr` (`header_size` bytes)
+    ///   must point into the live allocations owned by `src_keep` / `hdr_keep`.
+    /// - `out_dst_buffer` (`in_dst_buffer_size` bytes) must remain valid and
+    ///   writable until the returned future resolves — the SDK writes the
+    ///   result there asynchronously. The caller owns it (e.g. a pipeline
+    ///   output-slot keepalive on the same ticket as this future).
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn get_image_future_owned(
+        self: &Arc<Self>,
+        in_process_ref:     ProcessRef,
+        out_dst_buffer:     *mut CrmVoid,
+        in_dst_buffer_size: CrmUInt32,
+        in_bits_per_sample: CrmUInt32,
+        in_samples_per_pixel: CrmUInt32,
+        in_bytes_per_line:  CrmUInt32,
+        in_sample_sequence: CrmUInt32,
+        src_ptr:            *const u8,
+        src_size:           CrmUInt32,
+        in_dev_param:       Box<DevParamV13>,
+        in_res_param:       Box<ResParamV13>,
+        header_ptr:         *const u8,
+        header_size:        CrmUInt32,
+        src_keep:           Box<dyn core::any::Any + Send>,
+        hdr_keep:           Box<dyn core::any::Any + Send>,
+    ) -> Result<OwnedGetImageFuture> {
+        let mut out_dst_data_size = Box::new(0u32);
+        let state = unsafe {
+            self.submit_get_image_async(
+                in_process_ref,
+                out_dst_buffer,
+                in_dst_buffer_size,
+                &mut *out_dst_data_size as *mut CrmUInt32,
+                in_bits_per_sample,
+                in_samples_per_pixel,
+                in_bytes_per_line,
+                in_sample_sequence,
+                src_ptr as *mut CrmVoid,
+                src_size,
+                &*in_dev_param as *const _ as *mut CrmVoid,
+                &*in_res_param as *const _ as *mut CrmVoid,
+                header_ptr as *mut CrmVoid,
+                header_size,
+            )?
+        };
+
+        Ok(OwnedGetImageFuture {
+            sdk:                self.clone(),
+            state,
+            _out_dst_data_size: out_dst_data_size,
+            _dev_param:         in_dev_param,
+            _res_param:         in_res_param,
+            _src_keep:          src_keep,
+            _hdr_keep:          hdr_keep,
         })
     }
 
@@ -2027,18 +2197,6 @@ impl Drop for CrmSdkLibrary {
     }
 }
 
-// SAFETY: `CrmSdkLibrary` holds a `libloading::Library` handle plus a set
-// of resolved function pointers. The library handle is reference-counted
-// by the loader; the function pointers are stateless once resolved. The
-// CRM C API exposes no apartment-model thread affinity (loaded via
-// `libloading`, no `Co*` calls). Concurrent `&self` access calls SDK
-// functions that the vendor documents as thread-safe for the
-// init/allocate/decode/release surface — see `crm-rs` audit basis in
-// stage-6c.md § 6c.0.4.
-unsafe impl Send for CrmSdkLibrary {}
-unsafe impl Sync for CrmSdkLibrary {}
-
-
 /// Owned device/CPU memory allocation from the CRM SDK. The `Arc<CrmSdkLibrary>`
 /// keeps the SDK deallocator symbol alive for the life of the allocation —
 /// no lifetime parameter, so the value moves cleanly into long-lived carriers
@@ -2049,6 +2207,11 @@ pub struct CrmMemory {
     size:   CrmUInt32,
     sdk:    Arc<CrmSdkLibrary>,
 }
+// CrmMemory — Send only. Plain device (or aligned CPU) memory; the
+// `Arc<CrmSdkLibrary>` keeps the deallocator symbol alive for the life of
+// the allocation. Single-owner GPU/CPU buffer → not `Sync`.
+unsafe impl Send for CrmMemory {}
+
 impl CrmMemory {
     pub fn new(sdk: Arc<CrmSdkLibrary>, size: CrmUInt32, device: Device) -> Result<Self> {
         let ptr = sdk.allocate(size, device)?;
@@ -2077,10 +2240,3 @@ impl Drop for CrmMemory {
         let _ = self.sdk.deallocate(self.ptr, self.device);
     }
 }
-
-// SAFETY: the underlying CRM allocation is plain device memory (or aligned
-// CPU memory for `Device::Cpu`); the `Arc<CrmSdkLibrary>` keeps the
-// deallocator symbol alive for the life of the allocation. The SDK has no
-// apartment-model thread affinity — canon-raw is loaded via `libloading`,
-// the C API has no `Co*` calls. Not `Sync` — single-owner GPU/CPU memory.
-unsafe impl Send for CrmMemory {}

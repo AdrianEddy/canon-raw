@@ -24,3 +24,18 @@ fn crm_memory_is_send() {
 fn decode_context_is_send() {
     assert_impl_all!(DecodeContext: Send);
 }
+
+#[test]
+fn owned_get_image_future_is_send() {
+    // A pipelined scheduler parks `depth` of these in a cross-thread pool.
+    assert_impl_all!(OwnedGetImageFuture: Send);
+}
+
+#[test]
+fn init_descriptors_are_send() {
+    #[cfg(not(target_vendor = "apple"))]
+    assert_impl_all!(CrmCudaInit: Send);
+    assert_impl_all!(CrmOpenClInit: Send);
+    #[cfg(target_vendor = "apple")]
+    assert_impl_all!(CrmMetalInit: Send);
+}

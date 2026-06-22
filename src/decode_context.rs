@@ -40,6 +40,34 @@ pub struct OutputGeometry {
     pub bytes_per_line:    u32,
 }
 
+impl OutputGeometry {
+    /// The SDK's output row pitch (`inBytesPerLine`) for a given output
+    /// width / bit depth / channel count.
+    ///
+    /// `CrmGetImage` packs each row into a whole number of 32-bit words:
+    /// `data_num_in_int = 32 / bits_per_sample` samples per `i32`, so a
+    /// row is `out_width * samples_per_pixel * 4 / data_num_in_int`
+    /// bytes. 12-bit is the documented special case — three 12-bit
+    /// samples share two `i32`s (`* 4 * 3 / 8`). This mirrors the SDK
+    /// sample code's `out_bytes_per_line` exactly (see
+    /// `TestCrmSdk.cpp` / the crate's `examples/decode*.rs`); callers
+    /// (e.g. `gpu-video`) must compute the same value to size the
+    /// `CrmGetImage` destination buffer, so it lives here as the SDK
+    /// wrapper's canonical formula rather than being re-derived per
+    /// call site.
+    #[inline]
+    pub const fn bytes_per_line(out_width: u32, bits_per_sample: u32, samples_per_pixel: u32) -> u32 {
+        let i32_bytes = core::mem::size_of::<i32>() as u32;
+        if bits_per_sample == 12 {
+            out_width * samples_per_pixel * i32_bytes * 3 / 8
+        } else {
+            let data_num_in_int = 32 / if bits_per_sample == 0 { 1 } else { bits_per_sample };
+            out_width * samples_per_pixel * i32_bytes
+                / if data_num_in_int == 0 { 1 } else { data_num_in_int }
+        }
+    }
+}
+
 /// Bundled per-decoder facade.
 ///
 /// Owns the SDK `ProcessRef`, the cached header pack covering the
@@ -86,6 +114,15 @@ pub struct DecodeContext {
     /// once the first frame has been resolved (always after `new()`).
     out_size:        Option<u32>,
 }
+
+// DecodeContext — Send only. Mutators take `&mut self` (the read paths
+// `decode_frame_*_into` take `&self`, where the SDK serializes internally
+// per the per-decoder contract); the `Arc<CrmSdkLibrary>` keeps the SDK
+// alive for `process_ref`. Not `Sync`: the cached header_pack / out_size
+// fields would let an interleaved `set_timed_meta` + `decode_frame_to_gpu`
+// against a *shared* reference violate the per-decoder single-consumer
+// contract.
+unsafe impl Send for DecodeContext {}
 
 impl DecodeContext {
     /// Construct + immediately resolve `out_size` from
@@ -343,14 +380,3 @@ fn effective_output_height(res_param: &ResParamV13) -> u32 {
     };
     h.div_ceil(factor)
 }
-
-// SAFETY: `ProcessRef` is opaque SDK state accessed only through `&mut
-// DecodeContext` (or `&self` for the read paths `decode_frame_*_into`,
-// where the SDK serializes internally per the per-decoder contract).
-// The `Arc<CrmSdkLibrary>` keeps the SDK alive for the life of
-// `process_ref`. Not `Sync` — the cached header_pack and out_size
-// fields are mutated by `&mut self` accessors that the Rust borrow
-// rules cover, but the decode loop's interleaved `set_timed_meta` +
-// `decode_frame_to_gpu` against a *shared* reference would violate the
-// per-decoder single-consumer contract.
-unsafe impl Send for DecodeContext {}
