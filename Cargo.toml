@@ -18,6 +18,11 @@ futures-util = "0.3"
 thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"], optional = true }
 bitflags = "2.10"
+# Shared SDK-free CRM ISOBMFF container parser (oxivideo workspace, Stage-9
+# §9.9). Cross-repo path dep — the SDK lane's `CrmMovie` is now thin glue over
+# `crm_container::CrmContainer`, single-sourcing the box layer with the oxiraw
+# lane.
+crm-container = { path = "../oxivideo/crm-container" }
 
 [features]
 default = ["serde"]
