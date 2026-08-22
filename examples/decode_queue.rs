@@ -8,7 +8,7 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 || common::has_flag(&args, "--help") {
         eprintln!(
-            "Usage:\n  cargo run --example decode_queue -- <input.CRM> --sdk-dll <path> --luts-dir <path> --out <dir>\n\
+            "Usage:\n  cargo run --example decode_queue -- <input.CRM> --sdk-dll <path> --luts-dir <dir containing CanonLUTs> --out <dir>\n\
              Optional:\n  --device <cpu|cuda|opencl> --frames <n>"
         );
         return Ok(());
@@ -45,7 +45,7 @@ fn main() -> Result<()> {
         .canon_metadata_box()
         .ok_or(CrmError::MissingData("Canon metadata box"))?
         .to_vec();
-    let craw_entry = crm.craw_entry().ok_or(CrmError::MissingData("CRAW entry"))?.to_vec();
+    let craw_entry = crm.craw_entry().to_vec();
 
     let lib = Arc::new(CrmSdkLibrary::load(&sdk_dll)?);
     lib.initialize_sdk()?;
@@ -103,87 +103,235 @@ fn main() -> Result<()> {
     let (out_w, out_h) = lib.get_out_image_size(&res_param, &header_pack0)?;
     let out_bits_per_sample = 8u32;
     let samples_per_pixel = 3u32;
-    let out_bytes_per_line = out_bytes_per_line(out_w, out_bits_per_sample, samples_per_pixel);
+    let out_bytes_per_line = OutputGeometry::bytes_per_line(out_w, out_bits_per_sample, samples_per_pixel);
     let dst_buffer_size = out_bytes_per_line * out_h;
     let dst_buffer = CrmMemory::new(lib.clone(), dst_buffer_size, Device::Cpu)?;
 
-    let mut next_enqueue = 0u64;
-    let mut outputs_written = 0u64;
-    let mut queue_draining = false;
     let frame_count = crm.frame_count().min(frames_limit);
 
+    let mut max_comp = 0u32;
+    let mut max_hdr = 0u32;
+    for i in 0..frame_count {
+        max_comp = max_comp.max(crm.compressed_frame_size(i)?);
+        max_hdr = max_hdr.max(header_pack0.len() as u32 + crm.timed_meta_size(i)?);
+    }
+
+    let mut slots: Vec<Slot> = Vec::new();
+    let mut free: Vec<usize> = Vec::new();
+    let mut next_enqueue = 0u64;
+    let mut outputs_written = 0u64;
+    let mut idle_polls = 0u32;
+
     loop {
-        if !queue_draining {
-            if next_enqueue < frame_count {
-                let frame = crm.read_compressed_frame(next_enqueue)?;
-                let timed = crm.read_timed_meta(next_enqueue)?;
-                let header_pack = lib.create_header_pack(&[
-                    Header { header_id: HeaderId::Uuid, data: canon_metadata_box.as_ptr() as *mut _, size: canon_metadata_box.len() as u32 },
-                    Header { header_id: HeaderId::Craw, data: craw_entry.as_ptr() as *mut _, size: craw_entry.len() as u32 },
-                    Header { header_id: HeaderId::TimedMetadata, data: timed.as_ptr() as *mut _, size: timed.len() as u32 },
-                ])?;
+        // ── exactly ONE enqueue per iteration (requirement 2) ────────────
+        if next_enqueue < frame_count {
+            let compressed = crm.read_compressed_frame(next_enqueue)?;
+            let timed = crm.read_timed_meta(next_enqueue)?;
+            let header_pack = lib.create_header_pack(&[
+                Header { header_id: HeaderId::Uuid, data: canon_metadata_box.as_ptr() as *mut _, size: canon_metadata_box.len() as u32 },
+                Header { header_id: HeaderId::Craw, data: craw_entry.as_ptr() as *mut _, size: craw_entry.len() as u32 },
+                Header { header_id: HeaderId::TimedMetadata, data: timed.as_ptr() as *mut _, size: timed.len() as u32 },
+            ])?;
 
-                let ref_con = Box::into_raw(Box::new(next_enqueue)) as *mut CrmVoid;
-                lib.enqueue_image(
-                    process_ref,
-                    out_bits_per_sample,
-                    samples_per_pixel,
-                    out_bytes_per_line,
-                    SampleSequence::Rgb as u32,
-                    frame.as_ptr() as *mut CrmVoid,
-                    frame.len() as u32,
-                    &dev_param,
-                    &res_param,
-                    ref_con,
-                    header_pack.as_ptr() as *mut CrmVoid,
-                    header_pack.len() as u32,
-                )?;
-                next_enqueue += 1;
-            } else {
-                queue_draining = true;
-                lib.enqueue_image(
-                    process_ref,
-                    out_bits_per_sample,
-                    samples_per_pixel,
-                    out_bytes_per_line,
-                    SampleSequence::Rgb as u32,
-                    std::ptr::null_mut(),
-                    0,
-                    &dev_param,
-                    &res_param,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    0,
-                )?;
-            }
+            // A slot is free only once its `inRefCon` has come back, i.e.
+            // once the SDK has finished reading its source buffer, so
+            // staging into it here can never disturb a pending job
+            // (requirement 1). The pool grows only while the SDK holds
+            // submissions without returning any, so it converges on the
+            // process ref's internal queue depth — a handful of slots, not
+            // one per frame of the movie.
+            let slot = match free.pop() {
+                Some(slot) => slot,
+                None => {
+                    if slots.len() == MAX_SLOTS {
+                        return Err(CrmError::Other(format!(
+                            "the SDK is holding {MAX_SLOTS} submissions without returning one at \
+                             {outputs_written}/{frame_count} frames — the queue is not draining"
+                        )));
+                    }
+                    slots.push(Slot::new(&lib, max_comp.max(1), max_hdr.max(1), slots.len())?);
+                    slots.len() - 1
+                }
+            };
+            slots[slot].stage(next_enqueue, &compressed, &header_pack);
+
+            let staged = &slots[slot];
+            lib.enqueue_image(
+                process_ref,
+                out_bits_per_sample,
+                samples_per_pixel,
+                out_bytes_per_line,
+                SampleSequence::Rgb as u32,
+                staged.src.as_ptr(),
+                staged.src_len,
+                &dev_param,
+                &res_param,
+                staged.ref_con(),
+                staged.hdr.as_ptr(),
+                staged.hdr_len,
+            )?;
+            next_enqueue += 1;
+        } else {
+            // End-of-stream sentinel — re-sent every drain iteration
+            // (requirement 3).
+            lib.enqueue_image(
+                process_ref,
+                out_bits_per_sample,
+                samples_per_pixel,
+                out_bytes_per_line,
+                SampleSequence::Rgb as u32,
+                std::ptr::null_mut(),
+                0,
+                &dev_param,
+                &res_param,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            )?;
         }
 
-        loop {
-            match lib.dequeue_image(process_ref, dst_buffer.as_ptr(), dst_buffer_size) {
-                Ok((dst_data_size, out_ref_con)) => {
-                    let frame_no = if out_ref_con.is_null() { outputs_written } else { unsafe { *Box::from_raw(out_ref_con as *mut u64) } };
-                    write_rgb8_jpeg(&out_dir, frame_no, dst_buffer.as_ptr(), dst_data_size, out_w, out_h)?;
-                    outputs_written += 1;
-                }
-                Err(CrmError::SdkError(SdkError::DevelopNotCompleted)) => break,
-                Err(CrmError::SdkError(SdkError::DevelopEmptyQueue)) => {
-                    queue_draining = true;
-                    break;
-                }
-                Err(e) => return Err(e),
+        // ── exactly ONE dequeue per iteration ────────────────────────────
+        match lib.dequeue_image(process_ref, dst_buffer.as_ptr(), dst_buffer_size) {
+            Ok((dst_data_size, out_ref_con)) => {
+                idle_polls = 0;
+                // `CrmDequeueImage` hands back the `inRefCon` of the
+                // submission that just completed. It names both the frame
+                // these pixels came from and the slot the SDK has stopped
+                // reading, so it is the one authority for recycling.
+                let tag = unsafe { (out_ref_con as *const Tag).as_ref() }.ok_or(CrmError::MissingData(
+                    "CrmDequeueImage returned a developed frame with no inRefCon",
+                ))?;
+                let Tag { frame, slot } = *tag;
+                write_rgb8_jpeg(&out_dir, frame, dst_buffer.as_ptr(), dst_data_size, out_w, out_h)?;
+                outputs_written += 1;
+                free.push(slot);
             }
-        }
-
-        if queue_draining && outputs_written >= frame_count {
-            break;
+            Err(CrmError::SdkError(SdkError::DevelopNotCompleted)) => {
+                // A real enqueue advanced the pipeline this iteration, so
+                // only the drain phase can actually spin.
+                if next_enqueue >= frame_count {
+                    idle_polls += 1;
+                    if idle_polls > MAX_IDLE_POLLS {
+                        return Err(CrmError::Other(format!(
+                            "the queue made no progress across {idle_polls} consecutive idle dequeues \
+                             at {outputs_written}/{frame_count} frames — poll budget exhausted, and \
+                             every idle poll leaks an SDK worker thread"
+                        )));
+                    }
+                    if idle_polls > FREE_IDLE_POLLS {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+            }
+            // The SDK's own end-of-drain — the ONLY termination condition.
+            Err(CrmError::SdkError(SdkError::DevelopEmptyQueue)) => break,
+            Err(e) => return Err(e),
         }
     }
 
+    let peak_slots = slots.len();
     lib.release_process_ref(process_ref)?;
+    // Every `CrmAllocate`d buffer goes back before `CrmTerminateSDK` tears
+    // the allocator down.
+    drop(slots);
+    drop(dst_buffer);
     lib.terminate_sdk()?;
 
-    println!("Wrote {outputs_written} frames to {}", out_dir.display());
+    println!("Wrote {outputs_written} frames to {} ({peak_slots} staging slots)", out_dir.display());
     Ok(())
+}
+
+/// Idle drain polls that run unpaced before the backoff kicks in.
+const FREE_IDLE_POLLS: u32 = 64;
+
+/// Absolute cap on consecutive idle drain polls — each one costs a leaked
+/// SDK thread, so this is the bound that keeps a wedged queue from taking
+/// the machine with it.
+const MAX_IDLE_POLLS: u32 = 2_000;
+
+/// Upper bound on the staging pool, i.e. on submissions the SDK may hold
+/// without returning one. Far above any real queue depth; it exists so a
+/// wedged queue fails loudly instead of allocating a slot per frame.
+const MAX_SLOTS: usize = 32;
+
+/// The `inRefCon` handed to `CrmEnqueueImage` and handed straight back by
+/// `CrmDequeueImage`. Owned by its [`Slot`] — never `Box::into_raw`'d — so
+/// no exit path out of the drain loop can leak it.
+#[derive(Clone, Copy)]
+struct Tag {
+    frame: u64,
+    slot:  usize,
+}
+
+/// One in-flight submission's `CrmAllocate`d staging.
+///
+/// The queue API's contract (CRMSDK 2.10). Requirements 1–3 are in neither
+/// the header nor the Interface Spec; all three were established
+/// empirically and are restated in full in gpu-video's
+/// `oxivideo/tests/common/crm_queue.rs`:
+///
+///   1. Source and header buffers must come from `CrmAllocate`
+///      ([`CrmMemory`]) — a plain Rust `Vec` faults the SDK's worker — and
+///      must be **per submission**. `CrmEnqueueImage` does *not* copy the
+///      source: `CrmImpl_EnqueueImage` stores the caller's `inSrcBuffer`
+///      pointer verbatim in its ring node (its one `memcpy` copies the
+///      header params `CrmGetParam` had just parsed out — which is why the
+///      header, unlike the source, *is* consumed eagerly), and a worker
+///      reads the frame later. Measured on CRMSDK 2.10 / RTX 5090:
+///      scribbling over a submitted source between `CrmEnqueueImage` and
+///      the next `CrmDequeueImage` fails the develop with `Unknown`;
+///      scribbling after that dequeue is harmless. A single shared staging
+///      buffer therefore survives *this exact* loop shape only because the
+///      overwrite happens to land before the enqueue — an undocumented
+///      window, and this ref keeps six submissions in flight inside it. One
+///      slot per submission costs a few MB and makes the question moot.
+///   2. Exactly one `CrmEnqueueImage` and one `CrmDequeueImage` per
+///      iteration — the enqueue is what advances the internal pipeline.
+///   3. The end-of-stream sentinel is a NULL enqueue on **every** drain
+///      iteration, not once. Termination is the SDK answering
+///      `DEVELOP_EMPTY_QUEUE`, never our own frame count.
+///
+/// Driving it any other way does not return an error: `CrmDequeueImage`
+/// answers `DEVELOP_NOT_COMPLETED` forever, and every such poll spawns —
+/// and leaks — an OS thread inside the SDK. 39 000 idle polls once produced
+/// 38 907 threads and 9.4 GB, so the drain below bounds the poll *count*,
+/// not just wall-clock.
+struct Slot {
+    src:     CrmMemory,
+    hdr:     CrmMemory,
+    src_len: u32,
+    hdr_len: u32,
+    tag:     Box<Tag>,
+}
+
+impl Slot {
+    fn new(lib: &Arc<CrmSdkLibrary>, src_capacity: u32, hdr_capacity: u32, index: usize) -> Result<Self> {
+        Ok(Self {
+            src:     CrmMemory::new(lib.clone(), src_capacity, Device::Cpu)?,
+            hdr:     CrmMemory::new(lib.clone(), hdr_capacity, Device::Cpu)?,
+            src_len: 0,
+            hdr_len: 0,
+            tag:     Box::new(Tag { frame: 0, slot: index }),
+        })
+    }
+
+    /// Stage one frame. Only ever called on a slot whose previous
+    /// submission has been dequeued, so the SDK is not reading it.
+    fn stage(&mut self, frame: u64, compressed: &[u8], header_pack: &[u8]) {
+        // SAFETY: both allocations were sized to the movie's largest frame
+        // and largest header pack respectively.
+        unsafe {
+            std::ptr::copy_nonoverlapping(compressed.as_ptr(), self.src.as_mut_ptr() as *mut u8, compressed.len());
+            std::ptr::copy_nonoverlapping(header_pack.as_ptr(), self.hdr.as_mut_ptr() as *mut u8, header_pack.len());
+        }
+        self.src_len = compressed.len() as u32;
+        self.hdr_len = header_pack.len() as u32;
+        self.tag.frame = frame;
+    }
+
+    fn ref_con(&self) -> *mut CrmVoid {
+        &*self.tag as *const Tag as *mut CrmVoid
+    }
 }
 
 fn pick_first_supported_gpu(lib: &CrmSdkLibrary, device: Device) -> Option<Gpu> {
@@ -208,15 +356,6 @@ fn pick_first_supported_gpu(lib: &CrmSdkLibrary, device: Device) -> Option<Gpu> 
         });
     }
     None
-}
-
-fn out_bytes_per_line(out_width: u32, bits_per_sample: u32, samples_per_pixel: u32) -> u32 {
-    if bits_per_sample == 12 {
-        out_width * samples_per_pixel * std::mem::size_of::<i32>() as u32 * 3 / 8
-    } else {
-        let data_num_in_int = 32 / bits_per_sample;
-        out_width * samples_per_pixel * std::mem::size_of::<i32>() as u32 / data_num_in_int
-    }
 }
 
 fn write_rgb8_jpeg(

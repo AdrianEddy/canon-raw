@@ -8,7 +8,7 @@ fn main() -> Result<()> {
     let frame = crm.read_compressed_frame(0)?;
     let timed_meta = crm.read_timed_meta(0).unwrap();
     let metadata_box = crm.canon_metadata_box().unwrap();
-    let craw_entry = crm.craw_entry().unwrap();
+    let craw_entry = crm.craw_entry();
     //dbg!(timed_meta);
 
 	let device = Device::Cpu;
@@ -22,7 +22,8 @@ fn main() -> Result<()> {
 
     let lib = Arc::new(CrmSdkLibrary::load("D:\\programowanie\\projekty\\Rust\\crm-rs\\sdk\\CRMSDK210\\CRMSDK\\Win_Lib\\x64\\CrmSdk.dll").unwrap());
     lib.initialize_sdk().unwrap();
-	lib.set_luts_directory("D:\\programowanie\\projekty\\Rust\\crm-rs\\sdk\\CRMSDK210\\CRMSDK\\CanonLUTs\\", true).unwrap();
+	// The directory that CONTAINS `CanonLUTs` — the SDK appends the folder name.
+	lib.set_luts_directory("D:\\programowanie\\projekty\\Rust\\crm-rs\\sdk\\CRMSDK210\\CRMSDK", true).unwrap();
 
 	//Get GPU information
 	//let sys_info = lib.get_gpu_system_info_with_device(device).unwrap();
@@ -101,12 +102,8 @@ fn main() -> Result<()> {
 	let out_bits_per_sample = 8; // 8-bit
 	let samples_per_pixel = 3; // RGB
 
-	let out_bytes_per_line = if out_bits_per_sample == 12 {
-		out_width * samples_per_pixel * std::mem::size_of::<i32>() as u32 * 3 / 8
-	} else {
-		let data_num_in_int = 32 / out_bits_per_sample;
-		out_width * samples_per_pixel * std::mem::size_of::<i32>() as u32 / data_num_in_int
-	};
+	let out_bytes_per_line =
+		OutputGeometry::bytes_per_line(out_width, out_bits_per_sample, samples_per_pixel);
 	let dst_buffer_size = out_bytes_per_line * out_height;
 	let dst_buffer = CrmMemory::new(lib.clone(), dst_buffer_size, device).unwrap();
 

@@ -29,7 +29,7 @@ default = ["serde"]
 serde = ["dep:serde"]
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation","Win32_System_Com","Win32_System_Variant", "Win32_System_Ole", "Win32_System_LibraryLoader"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation","Win32_Globalization","Win32_System_Com","Win32_System_Variant", "Win32_System_Ole", "Win32_System_LibraryLoader"] }
 
 [dev-dependencies]
 pollster = "0.4"

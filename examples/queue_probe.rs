@@ -4,7 +4,8 @@
 //! heavy stderr tracing so we see exactly which FFI call faults.
 //!
 //!   cargo run --release --example queue_probe -- <in.CRM> \
-//!       --sdk-dll <CrmSdk.dll> --luts-dir <CanonLUTs> [--frames 12] [--device cpu|cuda]
+//!       --sdk-dll <CrmSdk.dll> --luts-dir <dir containing CanonLUTs> [--frames 12]
+//!       [--device cpu|cuda]
 
 use std::sync::Arc;
 use canon_raw::crm_parser::CrmMovie;
@@ -56,7 +57,7 @@ fn main() -> Result<()> {
     let f = std::fs::File::open(&input)?;
     let mut crm = CrmMovie::load(f)?;
     let uuid = crm.canon_metadata_box().ok_or(CrmError::MissingData("uuid"))?.to_vec();
-    let craw = crm.craw_entry().ok_or(CrmError::MissingData("craw"))?.to_vec();
+    let craw = crm.craw_entry().to_vec();
 
     // Frame 0: compressed bytes + timed meta + header pack (Rust Vecs).
     let comp = crm.read_compressed_frame(0)?;
@@ -99,7 +100,7 @@ fn main() -> Result<()> {
     };
 
     let (out_w, out_h) = lib.get_out_image_size(&res, &header_pack)?;
-    let out_bpl = out_w * samples * 4 / (32 / bits);
+    let out_bpl = OutputGeometry::bytes_per_line(out_w, bits, samples);
     let out_size = out_bpl * out_h;
     trace!("    out {out_w}x{out_h}, bpl={out_bpl}, dst={} MiB", out_size / (1024*1024));
 
@@ -214,7 +215,7 @@ fn main() -> Result<()> {
                 out_data_type: DataType::CrmDecompressed, out_buffer_type: BufferType::Cpu, decode_level: DecodeLevel::Full,
             };
             let (dw, dh) = lib.get_out_image_size(&dres, &header_pack)?;
-            let dbpl = dw * 2; // 16-bit, 1 sample bayer
+            let dbpl = OutputGeometry::bytes_per_line(dw, 16, 1); // 16-bit, 1 sample bayer
             let dsize = dbpl * dh;
             let dref = lib.create_process_ref(format_id, device, use_gpu, ProcessType::DECOMPRESS, Resolution::K8)?;
             let dbuf = CrmMemory::new(lib.clone(), dsize, Device::Cpu)?;

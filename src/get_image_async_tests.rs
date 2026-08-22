@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright © 2025 Adrian <adrian.eddy at gmail>
 
-//! Lifecycle test for the `GetImageAsyncState` co-ownership model shared
-//! by `GetImageFuture` / `OwnedGetImageFuture`.
+//! Lifecycle test for the private `GetImageAsyncState` co-ownership model
+//! shared by `GetImageFuture` / `OwnedGetImageFuture`.
 //!
 //! Exercises the real `Arc::into_raw` / `Arc::from_raw` balance used by
 //! `get_image_future*` (the SDK is handed an owned refcount via `ref_con`)
@@ -10,6 +10,9 @@
 //! running a job, so it needs no codec or GPU. It is the hardware-free
 //! proof that dropping a pending future does NOT free the state out from
 //! under a not-yet-fired completion callback.
+//!
+//! Lives inside the crate (not in `tests/`) because `GetImageAsyncState`
+//! and its fields are private implementation details of the async path.
 
 use crate::GetImageAsyncState;
 use std::sync::Arc;

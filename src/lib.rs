@@ -9,7 +9,9 @@
 use core::ffi::{c_char, c_float, c_int, c_short, c_schar, c_uchar, c_uint, c_ulonglong, c_ushort, c_void};
 use futures_util::task::AtomicWaker;
 use std::{
+    ffi::CString,
     future::Future,
+    path::Path,
     pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -23,6 +25,18 @@ pub mod decode_context;
 pub mod error;
 pub use decode_context::{DecodeContext, OutputGeometry};
 pub use error::*;
+
+// Crate-internal lifecycle test for the private `GetImageAsyncState`
+// co-ownership model (needs access to its private fields, so it cannot live in
+// `tests/`). Hardware-free — no SDK, no GPU.
+#[cfg(test)]
+mod get_image_async_tests;
+
+// Crate-internal gates for the private `Path` -> `CrmChar*` encoder (project
+// rule: tests never inline with the implementation). Hardware-free.
+#[cfg(test)]
+#[path = "sdk_path_tests.rs"]
+mod sdk_path_tests;
 
 #[cfg(target_os = "windows")]
 use libloading::os::windows as dl;
@@ -1221,7 +1235,24 @@ pub struct CrmSdkLibrary {
     pub CrmDeviceDeallocate: dl::Symbol<CrmDeviceDeallocateFn>,
 
     pub CrmGetImage: dl::Symbol<CrmGetImageFn>,
-    pub CrmGetImageAsync: dl::Symbol<CrmGetImageAsyncFn>,
+    // Exported with C++ linkage on some SDK builds even though `CrmSdk.h`
+    // declares it inside `extern "C"`, so the name to look up is
+    // toolchain-mangled and platform-specific — and differs per platform for
+    // the *same* SDK version. Verified against CRMSDK 2.10: `CrmSdk.dll`
+    // (Win x64) exports `?CrmGetImageAsync@@YA?AW4CrmError@@…`,
+    // `libCrmSdk.so.2.10` exports the Itanium form
+    // `_Z16CrmGetImageAsyncPvS_jPjjjjj…`, and the macOS framework exports it
+    // unmangled. It is not the only mangled entry either: the Windows DLL's
+    // 41-entry export table carries four (`CrmGetColorSpace`,
+    // `CrmGetImageAsync`, `CrmReadProcessInfo`, `CrmWriteProcessInfo`) — this
+    // is simply the only one the crate binds, the other three being absent
+    // from the public header.
+    //
+    // Hence `Option`: an entry whose exported name is a build artefact may
+    // not be there at all. `None` when the current SDK build/platform
+    // exports no name we recognise — the async path is then unavailable, but
+    // the synchronous `get_image` path still works.
+    pub CrmGetImageAsync: Option<dl::Symbol<CrmGetImageAsyncFn>>,
     pub CrmEnqueueImage: dl::Symbol<CrmEnqueueImageFn>,
     pub CrmDequeueImage: dl::Symbol<CrmDequeueImageFn>,
 
@@ -1268,61 +1299,121 @@ pub struct CrmSdkLibrary {
 unsafe impl Send for CrmSdkLibrary {}
 unsafe impl Sync for CrmSdkLibrary {}
 
+/// Encode a filesystem path the way `CrmSdk` decodes it.
+///
+/// The SDK's path arguments are `CrmChar*` — plain `char*`. On Windows it
+/// widens them with `MultiByteToWideChar(CP_THREAD_ACP, …)` before the
+/// `_wfopen`, so the bytes it wants are the thread's ANSI code page, **not**
+/// UTF-8; handing it `str::as_bytes()` mis-decodes every non-ASCII path on a
+/// non-UTF-8 ACP. On the POSIX builds `char*` IS the OS byte string, so the
+/// `OsStr` bytes go through unchanged.
+///
+/// Errors instead of panicking on caller data the SDK cannot express: an
+/// interior NUL, or (Windows) a character with no ACP representation.
+fn sdk_path_cstring(path: &Path) -> Result<CString> {
+    #[cfg(target_os = "windows")]
+    let bytes = {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Globalization::{CP_THREAD_ACP, WC_NO_BEST_FIT_CHARS, WideCharToMultiByte};
+
+        let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        if wide.is_empty() {
+            Vec::new()
+        } else {
+            // SAFETY: `wide` is a valid `[u16]` of `wide.len()`; a null
+            // destination with size 0 is the documented length query.
+            let len = unsafe {
+                WideCharToMultiByte(CP_THREAD_ACP, WC_NO_BEST_FIT_CHARS, wide.as_ptr(), wide.len() as i32, std::ptr::null_mut(), 0, std::ptr::null(), std::ptr::null_mut())
+            };
+            if len <= 0 {
+                return Err(CrmError::InvalidParameter("path is not representable in the ANSI code page the SDK decodes with"));
+            }
+            let mut buf = vec![0u8; len as usize];
+            let mut used_default: CrmBool = 0;
+            // SAFETY: `buf` has exactly the `len` bytes the query asked for.
+            let written = unsafe {
+                WideCharToMultiByte(CP_THREAD_ACP, WC_NO_BEST_FIT_CHARS, wide.as_ptr(), wide.len() as i32, buf.as_mut_ptr(), len, std::ptr::null(), &mut used_default)
+            };
+            if written != len || used_default != 0 {
+                return Err(CrmError::InvalidParameter("path is not representable in the ANSI code page the SDK decodes with"));
+            }
+            buf
+        }
+    };
+    #[cfg(not(target_os = "windows"))]
+    let bytes = {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    };
+
+    CString::new(bytes).map_err(|_| CrmError::InvalidParameter("path contains an interior NUL byte"))
+}
+
 impl CrmSdkLibrary {
     pub fn load<P: libloading::AsFilename>(path: P) -> std::result::Result<Self, libloading::Error> {
         unsafe {
             let lib = dl::Library::new(path)?;
             Ok(Self {
-                CrmInitializeSDK: lib.get(b"CrmInitializeSDK\0").unwrap(),
-                CrmInitializeSDKWithOpenCL: lib.get(b"CrmInitializeSDKWithOpenCL\0").unwrap(),
-                CrmInitializeSDKWithDevice: lib.get(b"CrmInitializeSDKWithDevice\0").unwrap(),
-                CrmTerminateSDK: lib.get(b"CrmTerminateSDK\0").unwrap(),
+                CrmInitializeSDK: lib.get(b"CrmInitializeSDK\0")?,
+                CrmInitializeSDKWithOpenCL: lib.get(b"CrmInitializeSDKWithOpenCL\0")?,
+                CrmInitializeSDKWithDevice: lib.get(b"CrmInitializeSDKWithDevice\0")?,
+                CrmTerminateSDK: lib.get(b"CrmTerminateSDK\0")?,
 
-                CrmGetFormatId: lib.get(b"CrmGetFormatId\0").unwrap(),
-                CrmCreateProcessRef: lib.get(b"CrmCreateProcessRef\0").unwrap(),
-                CrmResetProcessRef: lib.get(b"CrmResetProcessRef\0").unwrap(),
-                CrmReleaseProcessRef: lib.get(b"CrmReleaseProcessRef\0").unwrap(),
+                CrmGetFormatId: lib.get(b"CrmGetFormatId\0")?,
+                CrmCreateProcessRef: lib.get(b"CrmCreateProcessRef\0")?,
+                CrmResetProcessRef: lib.get(b"CrmResetProcessRef\0")?,
+                CrmReleaseProcessRef: lib.get(b"CrmReleaseProcessRef\0")?,
 
-                CrmAllocate: lib.get(b"CrmAllocate\0").unwrap(),
-                CrmDeallocate: lib.get(b"CrmDeallocate\0").unwrap(),
-                CrmDeviceAllocate: lib.get(b"CrmDeviceAllocate\0").unwrap(),
-                CrmDeviceDeallocate: lib.get(b"CrmDeviceDeallocate\0").unwrap(),
+                CrmAllocate: lib.get(b"CrmAllocate\0")?,
+                CrmDeallocate: lib.get(b"CrmDeallocate\0")?,
+                CrmDeviceAllocate: lib.get(b"CrmDeviceAllocate\0")?,
+                CrmDeviceDeallocate: lib.get(b"CrmDeviceDeallocate\0")?,
 
-                CrmGetImage: lib.get(b"CrmGetImage\0").unwrap(),
-                CrmGetImageAsync: lib.get(b"?CrmGetImageAsync@@YA?AW4CrmError@@PEAX0IPEAIIIII0I00PEAPEAX0IP6A?AW41@00IIIIII0I0000IW41@@Z@Z\0").unwrap(),
-                CrmEnqueueImage: lib.get(b"CrmEnqueueImage\0").unwrap(),
-                CrmDequeueImage: lib.get(b"CrmDequeueImage\0").unwrap(),
+                CrmGetImage: lib.get(b"CrmGetImage\0")?,
+                // Best-effort, non-fatal: try every name CRMSDK 2.10 is known
+                // to export it under — MSVC mangling (Windows), Itanium
+                // mangling (Linux), then the plain name (macOS, and any build
+                // that gets the `extern "C"` right). If none resolves,
+                // `load()` still succeeds and only the async path is
+                // unavailable.
+                CrmGetImageAsync: lib
+                    .get(b"?CrmGetImageAsync@@YA?AW4CrmError@@PEAX0IPEAIIIII0I00PEAPEAX0IP6A?AW41@00IIIIII0I0000IW41@@Z@Z\0")
+                    .or_else(|_| lib.get(b"_Z16CrmGetImageAsyncPvS_jPjjjjjS_jS_S_PS_S_jPF8CrmErrorS_S_jjjjjjS_jS_S_S_S_jS2_E\0"))
+                    .or_else(|_| lib.get(b"CrmGetImageAsync\0"))
+                    .ok(),
+                CrmEnqueueImage: lib.get(b"CrmEnqueueImage\0")?,
+                CrmDequeueImage: lib.get(b"CrmDequeueImage\0")?,
 
-                CrmGetImageInfo: lib.get(b"CrmGetImageInfo\0").unwrap(),
-                CrmGetGpuSystemInfo: lib.get(b"CrmGetGpuSystemInfo\0").unwrap(),
-                CrmGetGpuInfoList: lib.get(b"CrmGetGpuInfoList\0").unwrap(),
-                CrmGetSdkInfo: lib.get(b"CrmGetSdkInfo\0").unwrap(),
-                CrmGetWBGain: lib.get(b"CrmGetWBGain\0").unwrap(),
-                CrmGetAcesIDT: lib.get(b"CrmGetAcesIDT\0").unwrap(),
-                CrmGetSdkInfoWithDevice: lib.get(b"CrmGetSdkInfoWithDevice\0").unwrap(),
-                CrmGetGpuSystemInfoWithDevice: lib.get(b"CrmGetGpuSystemInfoWithDevice\0").unwrap(),
-                CrmGetGpuInfoListWithDevice: lib.get(b"CrmGetGpuInfoListWithDevice\0").unwrap(),
+                CrmGetImageInfo: lib.get(b"CrmGetImageInfo\0")?,
+                CrmGetGpuSystemInfo: lib.get(b"CrmGetGpuSystemInfo\0")?,
+                CrmGetGpuInfoList: lib.get(b"CrmGetGpuInfoList\0")?,
+                CrmGetSdkInfo: lib.get(b"CrmGetSdkInfo\0")?,
+                CrmGetWBGain: lib.get(b"CrmGetWBGain\0")?,
+                CrmGetAcesIDT: lib.get(b"CrmGetAcesIDT\0")?,
+                CrmGetSdkInfoWithDevice: lib.get(b"CrmGetSdkInfoWithDevice\0")?,
+                CrmGetGpuSystemInfoWithDevice: lib.get(b"CrmGetGpuSystemInfoWithDevice\0")?,
+                CrmGetGpuInfoListWithDevice: lib.get(b"CrmGetGpuInfoListWithDevice\0")?,
 
                 #[cfg(target_os = "windows")]
-                CrmSetDeviceHandleForIntel: lib.get(b"CrmSetDeviceHandleForIntel\0").unwrap(),
+                CrmSetDeviceHandleForIntel: lib.get(b"CrmSetDeviceHandleForIntel\0")?,
                 #[cfg(target_os = "windows")]
-                CrmSetImageParamForIntel: lib.get(b"CrmSetImageParamForIntel\0").unwrap(),
+                CrmSetImageParamForIntel: lib.get(b"CrmSetImageParamForIntel\0")?,
                 #[cfg(target_os = "windows")]
-                CrmAllocateD3DSurfacesForIntel: lib.get(b"CrmAllocateD3DSurfacesForIntel\0").unwrap(),
+                CrmAllocateD3DSurfacesForIntel: lib.get(b"CrmAllocateD3DSurfacesForIntel\0")?,
                 #[cfg(target_os = "windows")]
-                CrmDeallocateD3DSurfacesForIntel: lib.get(b"CrmDeallocateD3DSurfacesForIntel\0").unwrap(),
+                CrmDeallocateD3DSurfacesForIntel: lib.get(b"CrmDeallocateD3DSurfacesForIntel\0")?,
                 #[cfg(target_os = "windows")]
-                CrmCreateDeviceHandleForIntel: lib.get(b"CrmCreateDeviceHandleForIntel\0").unwrap(),
+                CrmCreateDeviceHandleForIntel: lib.get(b"CrmCreateDeviceHandleForIntel\0")?,
                 #[cfg(target_os = "windows")]
-                CrmCleanupDeviceHandleForIntel: lib.get(b"CrmCleanupDeviceHandleForIntel\0").unwrap(),
+                CrmCleanupDeviceHandleForIntel: lib.get(b"CrmCleanupDeviceHandleForIntel\0")?,
 
-                CrmPreProcessForGetImageWithGpuMemory: lib.get(b"CrmPreProcessForGetImageWithGpuMemory\0").unwrap(),
-                CrmGetImageWithGpuMemory: lib.get(b"CrmGetImageWithGpuMemory\0").unwrap(),
+                CrmPreProcessForGetImageWithGpuMemory: lib.get(b"CrmPreProcessForGetImageWithGpuMemory\0")?,
+                CrmGetImageWithGpuMemory: lib.get(b"CrmGetImageWithGpuMemory\0")?,
 
-                CrmGetLastError: lib.get(b"CrmGetLastError\0").unwrap(),
-                CrmGetOutImageSize: lib.get(b"CrmGetOutImageSize\0").unwrap(),
-                CrmCreateHeaderPack: lib.get(b"CrmCreateHeaderPack\0").unwrap(),
-                CrmSetLUTsDirectory: lib.get(b"CrmSetLUTsDirectory\0").unwrap(),
+                CrmGetLastError: lib.get(b"CrmGetLastError\0")?,
+                CrmGetOutImageSize: lib.get(b"CrmGetOutImageSize\0")?,
+                CrmCreateHeaderPack: lib.get(b"CrmCreateHeaderPack\0")?,
+                CrmSetLUTsDirectory: lib.get(b"CrmSetLUTsDirectory\0")?,
 
                 lib,
             })
@@ -1410,6 +1501,34 @@ impl CrmSdkLibrary {
         Ok(out_format_id)
     }
 
+    /// Mint a decode context inside the SDK.
+    ///
+    /// # Hold it. Do not mint one per decode.
+    ///
+    /// A process ref is cheap on its own — creating and releasing one with no
+    /// decode in between moves neither the thread count nor the working set.
+    /// The first [`get_image`](Self::get_image) on it is not: the SDK lazily
+    /// builds a **worker pool on the ref** — measured at 76 extra OS threads and
+    /// ~2 GB of committed arena for a 6000 × 3164 clip on CRMSDK 2.10 — and
+    /// [`release_process_ref`](Self::release_process_ref) tears the whole thing
+    /// down again.
+    ///
+    /// That teardown races. It returns before every worker it spawned has
+    /// exited, and a straggler then enters a `CRITICAL_SECTION` the release has
+    /// already deleted: an `ACCESS_VIOLATION` writing
+    /// `RTL_CRITICAL_SECTION_DEBUG::ContentionCount` (offset `0x24`) through a
+    /// NULLed `DebugInfo`, on a thread whose stack is entirely
+    /// `RtlUserThreadStart` → `CrmSdk.dll` → `RtlEnterCriticalSection`. It needs
+    /// contention to lose, so it presents as a rare, load-dependent crash with
+    /// no relation to the parameters of the call that preceded it — which is how
+    /// it has already been misattributed once, to `CrmGetOutImageSize`.
+    ///
+    /// So every release after a decode is a dice roll. One ref held for the life
+    /// of a decoder is one roll; one per frame, or per test case, is one each.
+    /// [`reset_process_ref`](Self::reset_process_ref) is the between-decodes
+    /// reset that keeps the pool up and is the right call after a refused
+    /// decode. [`DecodeContext`] owns exactly one ref for its whole life for
+    /// this reason.
     #[inline]
     pub fn create_process_ref(
         &self,
@@ -1534,8 +1653,11 @@ impl CrmSdkLibrary {
         let mut token = GetImageAsyncToken { dst_data_size: Box::new(0) };
         let out_dst_data_size = &mut *token.dst_data_size as *mut CrmUInt32;
 
+        let async_fn = self.CrmGetImageAsync.as_ref().ok_or(CrmError::MissingData(
+            "CrmGetImageAsync is not available in this Canon SDK build",
+        ))?;
         self.err_to_result(unsafe {
-            (self.CrmGetImageAsync)(
+            (async_fn)(
                 in_process_ref,
                 out_dst_buffer,
                 in_dst_buffer_size,
@@ -1587,10 +1709,13 @@ impl CrmSdkLibrary {
         header_ptr:           *mut CrmVoid,
         header_size:          CrmUInt32,
     ) -> Result<Arc<GetImageAsyncState>> {
+        let async_fn = self.CrmGetImageAsync.as_ref().ok_or(CrmError::MissingData(
+            "CrmGetImageAsync is not available in this Canon SDK build",
+        ))?;
         let state = Arc::new(GetImageAsyncState::new());
         let ref_con = Arc::into_raw(state.clone()) as *mut CrmVoid;
         let submit_res = self.err_to_result(unsafe {
-            (self.CrmGetImageAsync)(
+            (async_fn)(
                 in_process_ref,
                 out_dst_buffer,
                 in_dst_buffer_size,
@@ -2171,9 +2296,39 @@ impl CrmSdkLibrary {
         Ok(())
     }
 
+    /// Point the SDK at the directory that **contains** the `CanonLUTs`
+    /// folder — not at `CanonLUTs` itself.
+    ///
+    /// `CrmSetLUTsDirectory` appends the folder name for you: inside
+    /// `CrmSdk.dll` the argument is only ever consumed as
+    /// `sprintf(buf, "%s\CanonLUTs", path)`, and each LUT is then opened as
+    /// `<buf>/<name>.bin`. That is what the spec's wording for
+    /// `inDirectoryPath` means (§ 7.2.18: *"a path of the directory where the
+    /// CanonLUTs folder is stored"*), so:
+    ///
+    /// | call | where the SDK looks |
+    /// |---|---|
+    /// | never called | `<dir of CrmSdk.dll>/CanonLUTs`, loaded during `CrmInitializeSDK*` |
+    /// | `is_absolute_path == false` | `<dir of CrmSdk.dll>/<path>/CanonLUTs` |
+    /// | `is_absolute_path == true` | `<path>/CanonLUTs` |
+    ///
+    /// # A wrong directory is a SILENT no-op
+    ///
+    /// The SDK does not validate `path`. Pointing it at a directory with no
+    /// `CanonLUTs` in it — or at a path that does not exist at all — still
+    /// returns [`SdkError::Ok`], and leaves whatever LUTs were loaded before
+    /// (normally the `CrmInitializeSDK*` default) in force. An `Ok` here is
+    /// therefore NOT evidence that the LUTs were found; a caller that needs
+    /// them must check `path.join("CanonLUTs")` itself. The mistake surfaces
+    /// only later, on the first develop whose recipe needs a 3-D LUT, as
+    /// [`SdkError::InvalidParameter`] plus `"The necessary LUT is not
+    /// available."` from [`get_last_error_string`](Self::get_last_error_string).
+    ///
+    /// Ordering: after SDK initialization, before the first
+    /// [`create_process_ref`](Self::create_process_ref) (spec § 7.2.18).
     #[inline]
-    pub fn set_luts_directory(&self, path: &str, is_absolute_path: bool) -> Result<()> {
-        let c_path = std::ffi::CString::new(path).unwrap();
+    pub fn set_luts_directory(&self, path: impl AsRef<Path>, is_absolute_path: bool) -> Result<()> {
+        let c_path = sdk_path_cstring(path.as_ref())?;
         self.err_to_result(unsafe { (self.CrmSetLUTsDirectory)(c_path.as_ptr() as *const CrmChar, is_absolute_path as CrmBool) })
     }
 

@@ -9,7 +9,7 @@ fn main() -> Result<()> {
     if args.len() < 2 || common::has_flag(&args, "--help") {
         eprintln!(
             "Usage:\n  cargo run --example metadata -- <input.CRM> [--out <dir>] [--frame <n> | --all-frames]\n\
-             Optional SDK info extraction:\n  --sdk-dll <path> --luts-dir <path> [--sdk-dir <dir>]"
+             Optional SDK info extraction:\n  --sdk-dll <path> --luts-dir <dir containing CanonLUTs> [--sdk-dir <dir>]"
         );
         return Ok(());
     }
@@ -28,7 +28,7 @@ fn main() -> Result<()> {
         .canon_metadata_box()
         .ok_or(CrmError::MissingData("Canon metadata box"))?
         .to_vec();
-    let craw_entry = crm.craw_entry().ok_or(CrmError::MissingData("CRAW entry"))?.to_vec();
+    let craw_entry = crm.craw_entry().to_vec();
 
     std::fs::write(out_dir.join("canon_metadata_box.bin"), &canon_metadata_box)?;
     std::fs::write(out_dir.join("craw_entry.bin"), &craw_entry)?;

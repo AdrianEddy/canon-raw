@@ -3,7 +3,8 @@
 //! (initialize_sdk); measures pure decode throughput on the calling machine.
 //!
 //!   cargo run --release --example crm_bench -- <in.CRM> \
-//!       --sdk-dll <CrmSdk.dll> --luts-dir <CanonLUTs> [--frames 24] [--pool-max 8]
+//!       --sdk-dll <CrmSdk.dll> --luts-dir <dir containing CanonLUTs> [--frames 24]
+//!       [--pool-max 8]
 //!       [--group sync,queue,pool,async]   (default: sync,queue,pool)
 //!
 //! Each result is printed (flushed) the instant it's measured, so a crash in a
@@ -73,7 +74,7 @@ fn main() -> Result<()> {
     let f = std::fs::File::open(&input)?;
     let mut crm = CrmMovie::load(f)?;
     let uuid = crm.canon_metadata_box().ok_or(CrmError::MissingData("uuid"))?.to_vec();
-    let craw = crm.craw_entry().ok_or(CrmError::MissingData("craw"))?.to_vec();
+    let craw = crm.craw_entry().to_vec();
     let total = crm.frame_count();
     let n = n.min(total as usize).max(1);
 
@@ -104,7 +105,7 @@ fn main() -> Result<()> {
     let (bits, samples) = (16u32, 4u32);
     let rgb_res = res_param(format_id, w, h, DataType::CrmCompressed, DataType::RgbLutApplied, BufferType::Cpu, BufferType::Cpu);
     let (ow, oh) = lib.get_out_image_size(&rgb_res, &frames[0].hdr)?;
-    let rgb_bpl = ow * samples * 4 / (32 / bits);
+    let rgb_bpl = OutputGeometry::bytes_per_line(ow, bits, samples);
     let rgb_size = rgb_bpl * oh;
 
     line!("\n{w}x{h} -> develop {ow}x{oh}  RGBA16 {} MiB/frame  gpu={gpu:?}  N={n}\n", rgb_size/(1024*1024));
@@ -220,6 +221,16 @@ fn main() -> Result<()> {
     }
 
     // ───────────────── POOL (sync CrmGetImage, CPU dev/out, K threads) ─────────────────
+    //
+    // NOTE — the ref-per-worker shape below is the SDK's most dangerous, and it
+    // is here on purpose: the pool measures K *independent* consumers, and
+    // `CrmGetImage` is single-consumer per ref. But `CrmGetImage` lazily builds
+    // a ~76-thread / ~2 GB worker pool on each ref and `CrmReleaseProcessRef`
+    // tears it down without joining every worker (see the hazard note on
+    // `CrmSdkLibrary::create_process_ref`), so the five waves below perform
+    // 1+2+4+6+8 = 21 concurrent teardowns — the exact contention the race needs.
+    // If this example ever dies inside `CrmSdk.dll` with no relation to the
+    // frame it was decoding, read that note before blaming the decode.
     if do_grp("pool") {
         line!("[POOL sync threads — CUDA-dev CPU-out, work-stealing]");
         for k in [1usize, 2, 4, 6, 8].into_iter().filter(|&k| k <= pool_max) {
@@ -360,7 +371,7 @@ fn run_async_stages(
     // DECOMPRESS-only ref + bayer sizing.
     let dres = res_param(format_id, w, h, DataType::CrmCompressed, DataType::CrmDecompressed, BufferType::Cpu, BufferType::Cpu);
     let (dw, dh) = lib.get_out_image_size(&dres, &frames[0].hdr)?;
-    let dbpl = dw * 2; let dsize = dbpl * dh;
+    let dbpl = OutputGeometry::bytes_per_line(dw, 16, 1); let dsize = dbpl * dh; // 16-bit, 1 sample bayer
     // Decompress is CPU-only (spec) — a CUDA decompress ref is rejected.
     let _ = gpu;
     let dref = lib.create_process_ref(format_id, Device::Cpu, Gpu::NotUse, ProcessType::DECOMPRESS, Resolution::K8)?;

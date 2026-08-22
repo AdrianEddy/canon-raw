@@ -10,7 +10,7 @@ fn main() -> Result<()> {
     let frame = crm.read_compressed_frame(0)?;
     let timed_meta = crm.read_timed_meta(0).unwrap();
     let metadata_box = crm.canon_metadata_box().unwrap();
-    let craw_entry = crm.craw_entry().unwrap();
+    let craw_entry = crm.craw_entry();
     //dbg!(timed_meta);
 
 	let device = Device::Cuda;
@@ -24,7 +24,8 @@ fn main() -> Result<()> {
 
     let lib = Arc::new(CrmSdkLibrary::load("D:\\programowanie\\projekty\\Rust\\crm-rs\\sdk\\CRMSDK210\\CRMSDK\\Win_Lib\\x64\\CrmSdk.dll").unwrap());
     lib.initialize_sdk().unwrap();
-	lib.set_luts_directory("D:\\programowanie\\projekty\\Rust\\crm-rs\\sdk\\CRMSDK210\\CRMSDK\\CanonLUTs\\", true).unwrap();
+	// The directory that CONTAINS `CanonLUTs` — the SDK appends the folder name.
+	lib.set_luts_directory("D:\\programowanie\\projekty\\Rust\\crm-rs\\sdk\\CRMSDK210\\CRMSDK", true).unwrap();
 
     let header_pack = lib.create_header_pack(&[
         Header { header_id: HeaderId::Uuid, data: metadata_box.as_ptr() as *mut _, size: metadata_box.len() as u32 },
@@ -78,7 +79,7 @@ fn main() -> Result<()> {
     let (out_w, out_h) = lib.get_out_image_size(&res_param, &header_pack)?;
     let out_bits_per_sample = 8u32;
     let samples_per_pixel = 3u32;
-    let out_bytes_per_line = out_bytes_per_line(out_w, out_bits_per_sample, samples_per_pixel);
+    let out_bytes_per_line = OutputGeometry::bytes_per_line(out_w, out_bits_per_sample, samples_per_pixel);
     let dst_buffer_size = out_bytes_per_line * out_h;
     dbg!(&dst_buffer_size);
     let dst_buffer = CrmMemory::new(lib.clone(), dst_buffer_size, Device::Cpu)?;
@@ -132,11 +133,3 @@ fn pick_first_supported_gpu(lib: &CrmSdkLibrary, device: Device) -> Option<Gpu> 
     None
 }
 
-fn out_bytes_per_line(out_width: u32, bits_per_sample: u32, samples_per_pixel: u32) -> u32 {
-    if bits_per_sample == 12 {
-        out_width * samples_per_pixel * std::mem::size_of::<i32>() as u32 * 3 / 8
-    } else {
-        let data_num_in_int = 32 / bits_per_sample;
-        out_width * samples_per_pixel * std::mem::size_of::<i32>() as u32 / data_num_in_int
-    }
-}

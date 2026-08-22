@@ -31,21 +31,27 @@ impl<R: Read + Seek> CrmMovie<R> {
     /// consumer (`oxivideo::decoder::crm`) reads `timed_meta[frame_no]` for every
     /// video frame and feeds it to `CrmGetImage` as the per-frame colour
     /// development metadata. So this validates — beyond the shared
-    /// [`CrmContainer`] checks — that the Canon `uuid` box and `CRAW` entry are
-    /// present, the video track is non-empty, the timed-metadata track is
-    /// non-empty, and its sample count matches the video frame count. (The
-    /// oxiraw lane uses [`CrmContainer`] directly and is best-effort about
-    /// timed-metadata — it only reads frame 0's as-shot WB — so these stricter
-    /// invariants live here in the SDK glue, not in the shared container.)
+    /// [`CrmContainer`] checks — that the Canon `uuid` box is present, the video
+    /// track is non-empty, the timed-metadata track is non-empty, and its sample
+    /// count matches the video frame count. (The oxiraw lane uses
+    /// [`CrmContainer`] directly and is best-effort about timed-metadata — it
+    /// only reads frame 0's as-shot WB — so these stricter invariants live here
+    /// in the SDK glue, not in the shared container.) The `CRAW` entry needs no
+    /// gate here: [`CrmContainer::load`] already declines without it.
+    ///
+    /// **Every one of those gates raises [`CrmError::MissingData`]** — the
+    /// crate's DECLINE shape (see this module's `map_err`), never
+    /// [`CrmError::InvalidFormat`].
+    /// They all say "this lane's requirements are not met by this file", which is
+    /// a statement about the LANE; only the shared container parser gets to say
+    /// the file is damaged.
     pub fn load(reader: R) -> Result<Self> {
         let inner = CrmContainer::load(reader).map_err(map_err)?;
         // Validate the SDK lane's required headers are present (the SDK's
-        // `CrmGetImage` needs both the Canon `uuid` box and the `CRAW` entry).
+        // `CrmGetImage` needs the Canon `uuid` box; the `CRAW` entry is a
+        // container-load invariant).
         if inner.canon_uuid_box().is_none() {
             return Err(CrmError::MissingData("Canon metadata box"));
-        }
-        if inner.craw_entry().is_none() {
-            return Err(CrmError::MissingData("CRAW entry"));
         }
         if inner.frame_count() == 0 {
             return Err(CrmError::MissingData("video index table"));
@@ -54,11 +60,32 @@ impl<R: Read + Seek> CrmMovie<R> {
             return Err(CrmError::MissingData("timed metadata index table"));
         }
         if inner.frame_count() != inner.timed_meta_count() {
-            return Err(CrmError::InvalidFormat(format!(
-                "video and timed meta frame counts don't match: {} vs {}",
-                inner.frame_count(),
-                inner.timed_meta_count(),
-            )));
+            // DECLINE, not damage. A timed-metadata track that is not
+            // index-parallel with the video track breaks an SDK-LANE requirement
+            // (`timed_meta[frame_no]` per video frame) that the shared container
+            // and the pure-Rust oxiraw lane do without — so the honest verdict is
+            // "this lane cannot serve this file", exactly like the three gates
+            // above it.
+            //
+            // This gate used to raise `InvalidFormat`, which
+            // `oxivideo::decoder::crm::container_error` classifies
+            // `CrmFault::Integrity` — on a `crx `-branded carrier a FATAL
+            // damaged-container verdict. A perfectly readable clip whose
+            // timed-metadata count was one off was therefore reported to the user
+            // as a CORRUPT FILE, and the `Fatal` class also stopped the
+            // dispatcher from offering it to the oxiraw lane that would have
+            // played it (`decoder::dispatch::build_crm` falls through on
+            // `Configuration` only).
+            //
+            // The counts are not in the message: `MissingData` carries a
+            // `&'static str`, and widening it would ripple through every
+            // exhaustive `CrmError` match in the workspace for a diagnostic that
+            // is a DECLINE — normally swallowed by the fall-through — and that
+            // the caller can read straight off `frame_count()` /
+            // `timed_meta_count()`.
+            return Err(CrmError::MissingData(
+                "per-video-frame timed metadata (its sample count differs from the video frame count)",
+            ));
         }
         Ok(Self { inner })
     }
@@ -106,7 +133,10 @@ impl<R: Read + Seek> CrmMovie<R> {
     }
 
     /// The **full** `CRAW` sample-entry bytes — the SDK's `kCrmHeaderCraw` header.
-    pub fn craw_entry(&self) -> Option<&[u8]> {
+    ///
+    /// Infallible: [`CrmContainer::load`] cannot get past `CMP1` without the
+    /// entry, so a loaded movie always carries it.
+    pub fn craw_entry(&self) -> &[u8] {
         self.inner.craw_entry()
     }
 
@@ -133,9 +163,40 @@ impl<R: Read + Seek> CrmMovie<R> {
 }
 
 /// Map a [`crm_container::CrmContainerError`] into the crate's [`CrmError`].
+///
+/// # The one line that matters: which variant means DAMAGE
+///
+/// `oxivideo::decoder::crm::container_error` reads this crate's error enum as a
+/// two-class verdict — [`CrmError::MissingData`] is a **decline**
+/// (`CrmFault::Unsupported` → `Configuration`, the class the dispatcher falls
+/// through to the pure-Rust `crm-oxiraw` lane on), and
+/// [`CrmError::InvalidFormat`] / [`CrmError::InvalidLength`] are **file damage**
+/// (`CrmFault::Integrity`, which on a `crx `-branded carrier is a FATAL
+/// "your clip is corrupt" report to the user).
+///
+/// So `InvalidFormat` is reserved for [`CrmContainerError::Parse`] — a box tree
+/// or sample table that genuinely does not resolve. Nothing that is merely "a
+/// shape this lane does not serve" may travel on it; [`CrmMovie::load`]'s own
+/// header gates all raise `MissingData` for exactly that reason.
 fn map_err(e: CrmContainerError) -> CrmError {
     match e {
         CrmContainerError::Io(io) => CrmError::Io(io),
+        // "A well-formed container this parser does not decode" and "a required
+        // box is absent" both land on `MissingData`: `CrmError` has no third
+        // shape.
+        //
+        // For `Unsupported` that is exact — it is the same verdict
+        // `crm_audio::classify_crm_container` reaches (`CrmFault::Unsupported`).
+        //
+        // For `MissingBox` it is deliberately CONSERVATIVE: the shared
+        // classifier calls a missing standard ISOBMFF box `Integrity`, and
+        // collapsing it here costs the SDK lane that damage signal. That is the
+        // safe direction — the SDK lane declines, the dispatcher hands the
+        // carrier to the oxiraw lane, and THAT lane's `CrmContainer::load` hits
+        // the same missing box and raises the `Integrity`/damaged verdict
+        // through the shared classifier. The alternative (a false `Fatal` from
+        // the first lane) would libel an intact clip and terminate the open.
+        CrmContainerError::Unsupported(w) => CrmError::MissingData(w),
         CrmContainerError::MissingBox(b) => CrmError::MissingData(b),
         CrmContainerError::Parse(m) => CrmError::InvalidFormat(m),
         CrmContainerError::FrameOutOfRange { index, count } => {

@@ -23,7 +23,7 @@ fn crm_movie_parses_sample_via_shared_container() {
     assert!(movie.frame_count() > 0, "video frames present");
 
     // The SDK headers the decode lane feeds to `CrmGetImage`.
-    let craw = movie.craw_entry().expect("CRAW entry (kCrmHeaderCraw)");
+    let craw = movie.craw_entry();
     assert!(craw.len() > 8 && &craw[4..8] == b"CRAW", "craw_entry is the full CRAW box");
     let uuid = movie.canon_metadata_box().expect("Canon uuid box (kCrmHeaderUuid)");
     assert!(uuid.len() > 24 && &uuid[4..8] == b"uuid", "canon_metadata_box is the full uuid box");
