@@ -8,6 +8,14 @@ All notable changes to `canon-raw` are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Metal init aborted the process: `CrmMetalInit` handed the SDK the bare `id<MTLDevice>` /
+  `id<MTLCommandQueue>`, but `CrmMtlObject` takes an `NSArray` of devices and an `NSArray` of
+  queues (Canon's Metal sample), and the SDK threw `NSInvalidArgumentException` through Rust
+  frames. It now builds one-element arrays, and `initialize_with_metal` keeps them retained
+  until `terminate_sdk`.
+
 ## [0.1.0]
 
 Initial release, against Canon CRMSDK 2.10.
@@ -26,14 +34,20 @@ Initial release, against Canon CRMSDK 2.10.
   the spec restricts run under a process-wide, reentrant `cuda_exclusion` on CUDA refs.
   The guard is public so applications can cover their own CUDA calls. CPU, OpenCL and
   Metal refs, and `CrmGetImageAsync`, stay concurrent.
-- `DecodeContext`: one process ref, both parameter structs, the header pack and the
-  resolved output raster kept together, with transactional geometry changes and the
-  SDK's undocumented `ResParamV13` pair constraints checked before any decode.
-  `decode_frame_cpu_into` is safe; it refuses short buffers and non-CPU outputs.
+- Process refs are leased: `CrmSdkLibrary::lease_process_ref` returns a
+  `ProcessRefLease`, which resets its ref and parks it for reuse when dropped. Parked
+  refs are released only when the SDK is terminated. On Windows, releasing a ref soon
+  after creating it can crash the process: the SDK frees a worker's state after a
+  bounded wait, and a worker that has not finished starting then runs on freed memory.
+- `DecodeContext`: one leased process ref, both parameter structs, the header pack and
+  the resolved output raster kept together, with transactional geometry changes and the
+  SDK's undocumented `ResParamV13` pair constraints checked before any decode — and
+  before the ref is leased. `decode_frame_cpu_into` is safe; it refuses short buffers
+  and non-CPU outputs.
 - `crm_parser::CrmMovie`: the `.CRM` container view the SDK consumes, built on
   `crm-container`.
 - Async decode through `GetImageFuture` / `OwnedGetImageFuture`, which wait for the job
   when dropped while pending, and owned CUDA / OpenCL / Metal init descriptors.
 
-[Unreleased]: https://github.com/AdrianEddy/crm-rs/compare/canon-raw-v0.1.0...HEAD
-[0.1.0]: https://github.com/AdrianEddy/crm-rs/releases/tag/canon-raw-v0.1.0
+[Unreleased]: https://github.com/AdrianEddy/canon-raw/compare/canon-raw-v0.1.0...HEAD
+[0.1.0]: https://github.com/AdrianEddy/canon-raw/releases/tag/canon-raw-v0.1.0

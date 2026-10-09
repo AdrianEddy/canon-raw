@@ -2,7 +2,7 @@
 
 [![crates.io](https://img.shields.io/crates/v/crm-container.svg)](https://crates.io/crates/crm-container)
 [![docs.rs](https://img.shields.io/docsrs/crm-container)](https://docs.rs/crm-container)
-[![CI](https://github.com/AdrianEddy/crm-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/AdrianEddy/crm-rs/actions/workflows/ci.yml)
+[![CI](https://github.com/AdrianEddy/canon-raw/actions/workflows/ci.yml/badge.svg)](https://github.com/AdrianEddy/canon-raw/actions/workflows/ci.yml)
 ![MSRV 1.88](https://img.shields.io/badge/MSRV-1.88-blue)
 ![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-informational)
 

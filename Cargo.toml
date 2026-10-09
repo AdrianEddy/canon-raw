@@ -7,7 +7,7 @@ edition = "2024"
 rust-version = "1.88"
 authors = ["Adrian <adrian.eddy at gmail>"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/AdrianEddy/crm-rs"
+repository = "https://github.com/AdrianEddy/canon-raw"
 
 [workspace.dependencies]
 crm-container = { version = "0.2.1", path = "crm-container" }

@@ -30,7 +30,8 @@ use std::sync::Arc;
 
 use crate::{
     BufferType, CrmError, CrmSdkLibrary, CrmVoid, DebayerSetting, DecodeLevel, DevParamV13, Device, Downscale,
-    FormatId, Gpu, Header, ProcessRef, ProcessType, Rect, ResParamV13, Resolution, Result, SampleSequence,
+    FormatId, Gpu, Header, ProcessRef, ProcessRefLease, ProcessType, Rect, ResParamV13, Resolution, Result,
+    SampleSequence,
 };
 
 // Crate-internal gates for the private validators + the resolve/commit
@@ -281,7 +282,10 @@ struct Resolved {
 ///   re-resolve; both are transactional.
 pub struct DecodeContext {
     sdk: Arc<CrmSdkLibrary>,
-    process_ref: ProcessRef,
+    /// Leased for the context's whole life; dropping the context parks it
+    /// again. No job can be pending on it by then: an async job's future
+    /// borrows `self`.
+    process_ref: ProcessRefLease,
     /// Lane the process_ref was created against. Kept for callers that
     /// need to know which memory domain `decode_frame_to_gpu`'s
     /// destination must live in; the output raster itself is
@@ -335,7 +339,7 @@ unsafe impl Send for DecodeContext {}
 impl std::fmt::Debug for DecodeContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DecodeContext")
-            .field("process_ref", &self.process_ref)
+            .field("process_ref", &self.process_ref.process_ref())
             .field("device", &self.device)
             .field("format_id", &self.format_id)
             .field("sample_sequence", &self.sample_sequence)
@@ -355,7 +359,7 @@ impl DecodeContext {
     /// make them disagree; from then on `res_param` is the single store
     /// and [`geometry`](Self::geometry) reads back out of it.
     ///
-    /// Fails — releasing the process ref — if the pair constraints or the
+    /// Fails — before leasing a process ref — if the pair constraints or the
     /// resolved raster reject the combination, rather than handing back a
     /// context whose every decode would fail. See
     /// [`set_geometry`](Self::set_geometry) for the rules.
@@ -375,11 +379,16 @@ impl DecodeContext {
         sample_sequence: SampleSequence,
         geometry: OutputGeometry,
     ) -> Result<Self> {
-        let process_ref = sdk.create_process_ref(format_id, use_device, use_gpu, process_type, max_res)?;
         let mut header_pack = Vec::with_capacity(64 * 1024);
         Self::build_header_pack_into(&sdk, &uuid_box, &craw_entry, initial_timed_meta, &mut header_pack)?;
+        // Resolving needs the header pack, not the process ref, so every way
+        // `new` can fail is decided before a ref is leased.
+        let res_param = probe_res_param(&res_param, &geometry);
+        let resolved =
+            Self::resolve(&sdk, &header_pack, &res_param, geometry.bits_per_sample, geometry.samples_per_pixel)?;
+        let process_ref = sdk.lease_process_ref(format_id, use_device, use_gpu, process_type, max_res)?;
 
-        let mut me = Self {
+        Ok(Self {
             sdk,
             process_ref,
             device: use_device,
@@ -390,16 +399,12 @@ impl DecodeContext {
             craw_entry,
             format_id,
             sample_sequence,
-            bits_per_sample: 0,
-            samples_per_pixel: 0,
-            out_dims: (0, 0),
-            bytes_per_line: 0,
-            out_size: 0,
-        };
-        let probe = probe_res_param(&me.res_param, &geometry);
-        // On `Err`, `me` drops here and `Drop` releases `process_ref`.
-        me.commit_res_param(probe, geometry.bits_per_sample, geometry.samples_per_pixel)?;
-        Ok(me)
+            bits_per_sample: geometry.bits_per_sample,
+            samples_per_pixel: geometry.samples_per_pixel,
+            out_dims: resolved.dims,
+            bytes_per_line: resolved.bytes_per_line,
+            out_size: resolved.out_size,
+        })
     }
 
     /// The scaling fields + sample layout the context is resolved for,
@@ -465,7 +470,8 @@ impl DecodeContext {
     /// step the UI advertises and the decoder then cannot serve.
     pub fn output_dimensions_for(&self, geometry: &OutputGeometry) -> Result<(u32, u32)> {
         let probe = probe_res_param(&self.res_param, geometry);
-        Ok(self.resolve(&probe, geometry.bits_per_sample, geometry.samples_per_pixel)?.dims)
+        Ok(Self::resolve(&self.sdk, &self.header_pack, &probe, geometry.bits_per_sample, geometry.samples_per_pixel)?
+            .dims)
     }
 
     /// Update the decode rung: validate, re-resolve the output raster
@@ -531,7 +537,7 @@ impl DecodeContext {
         // past the size it is given.
         unsafe {
             self.sdk.get_image(
-                self.process_ref,
+                self.process_ref.process_ref(),
                 dst.as_mut_ptr() as *mut CrmVoid,
                 dst.len().min(u32::MAX as usize) as u32,
                 self.bits_per_sample,
@@ -598,7 +604,7 @@ impl DecodeContext {
         // destination is the caller's contract, its size checked above.
         unsafe {
             self.sdk.get_image(
-                self.process_ref,
+                self.process_ref.process_ref(),
                 gpu_dst,
                 gpu_dst_size,
                 self.bits_per_sample,
@@ -650,7 +656,7 @@ impl DecodeContext {
         // caller's contract.
         unsafe {
             self.sdk.get_image_future(
-                self.process_ref,
+                self.process_ref.process_ref(),
                 dst,
                 dst_size,
                 self.bits_per_sample,
@@ -754,9 +760,12 @@ impl DecodeContext {
         &self.sdk
     }
 
-    /// The active `ProcessRef`. Released automatically on `Drop`.
+    /// The context's `ProcessRef`, leased from the library's pool for the
+    /// context's whole life (see [`CrmSdkLibrary::lease_process_ref`]). It
+    /// is live until the context is dropped, so anything submitted on it
+    /// directly must be complete by then.
     pub fn process_ref(&self) -> ProcessRef {
-        self.process_ref
+        self.process_ref.process_ref()
     }
 
     /// Ask the SDK what `probe` produces, and reject what it cannot
@@ -833,12 +842,18 @@ impl DecodeContext {
     /// sizing: § 7.3.4 marks it **Deprecated** and binds it to the
     /// deprecated `CrmGetImageWithGpuMemory` flow (§ 7.3.5) — it demands
     /// `kCrmDeviceOpenCl` and has no bearing on `CrmGetImage`.
-    fn resolve(&self, probe: &ResParamV13, bits_per_sample: u32, samples_per_pixel: u32) -> Result<Resolved> {
+    fn resolve(
+        sdk: &CrmSdkLibrary,
+        header_pack: &[u8],
+        probe: &ResParamV13,
+        bits_per_sample: u32,
+        samples_per_pixel: u32,
+    ) -> Result<Resolved> {
         // Everything decidable in Rust, FIRST — the SDK is only ever asked
         // about inputs we already believe in.
         check_res_param_pairs(probe)?;
         check_extent(&probe.crop, samples_per_pixel)?;
-        let (w, h) = self.sdk.get_out_image_size(probe, &self.header_pack)?;
+        let (w, h) = sdk.get_out_image_size(probe, header_pack)?;
         if w == 0 || h == 0 {
             return Err(CrmError::InvalidParameter(ERR_EMPTY_RASTER));
         }
@@ -859,7 +874,7 @@ impl DecodeContext {
     /// derivation (a second copy of it would be a way for the cached
     /// raster to drift from the struct).
     fn commit_res_param(&mut self, probe: ResParamV13, bits_per_sample: u32, samples_per_pixel: u32) -> Result<u32> {
-        let resolved = self.resolve(&probe, bits_per_sample, samples_per_pixel)?;
+        let resolved = Self::resolve(&self.sdk, &self.header_pack, &probe, bits_per_sample, samples_per_pixel)?;
         self.res_param = probe;
         self.bits_per_sample = bits_per_sample;
         self.samples_per_pixel = samples_per_pixel;
@@ -878,14 +893,6 @@ impl DecodeContext {
     ) -> Result<()> {
         let headers = [Header::uuid(uuid), Header::craw(craw), Header::timed_metadata(timed_meta)];
         sdk.create_header_pack_into(&headers, dst)
-    }
-}
-
-impl Drop for DecodeContext {
-    fn drop(&mut self) {
-        // SAFETY: `process_ref` was created in `new` and is released only
-        // here. No job can be pending: an async job's future borrows `self`.
-        let _ = unsafe { self.sdk.release_process_ref(self.process_ref) };
     }
 }
 

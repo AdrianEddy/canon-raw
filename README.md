@@ -6,7 +6,7 @@ straight into CUDA / OpenCL / Metal memory.
 
 [![crates.io](https://img.shields.io/crates/v/canon-raw.svg)](https://crates.io/crates/canon-raw)
 [![docs.rs](https://img.shields.io/docsrs/canon-raw)](https://docs.rs/canon-raw)
-[![CI](https://github.com/AdrianEddy/crm-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/AdrianEddy/crm-rs/actions/workflows/ci.yml)
+[![CI](https://github.com/AdrianEddy/canon-raw/actions/workflows/ci.yml/badge.svg)](https://github.com/AdrianEddy/canon-raw/actions/workflows/ci.yml)
 ![MSRV 1.88](https://img.shields.io/badge/MSRV-1.88-blue)
 ![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20Linux%20%7C%20macOS-success)
 ![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-informational)

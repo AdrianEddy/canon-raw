@@ -24,10 +24,12 @@ pub mod cuda_exclusion;
 pub mod decode_context;
 pub mod error;
 pub mod image_info;
+mod ref_pool;
 pub use cuda_exclusion::{CudaExclusionGuard, cuda_exclusion};
 pub use decode_context::{DecodeContext, OutputGeometry};
 pub use error::*;
 pub use image_info::ImageInfo;
+pub use ref_pool::ProcessRefLease;
 
 // Crate-internal lifecycle test for the private `GetImageAsyncState`
 // co-ownership model (needs access to its private fields, so it cannot live in
@@ -676,12 +678,19 @@ pub struct CudaObject {
 #[cfg(not(target_vendor = "apple"))]
 pub type CudaObjectRef = *mut CudaObject;
 
+/// `CrmMtlObject`. Both pointers are Objective-C ARRAYS, though `CrmSdkTypes.h`
+/// types them `CrmVoid*`: Canon's Metal sample (`TestCrmSdkMac/MyObject.mm`)
+/// passes `MTLCopyAllDevices()` and an `NSMutableArray` of queues, and the SDK
+/// sends `NSArray` messages to both. [`CrmMetalInit`] builds them.
 #[cfg(target_vendor = "apple")]
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct MtlObject {
+    /// An `NSArray` of `device_num` `id<MTLDevice>`s.
     pub device_ids: *mut CrmVoid,
     pub device_num: CrmUInt32,
+    /// Null (the SDK makes its own queues), or an `NSArray` of one
+    /// `id<MTLCommandQueue>` per device.
     pub command_queue: *mut CrmVoid,
 }
 #[cfg(target_vendor = "apple")]
@@ -817,11 +826,79 @@ impl std::fmt::Debug for CrmOpenClInit {
     }
 }
 
+/// The CoreFoundation calls Metal init needs: a `CFArray` IS an `NSArray`
+/// (toll-free bridged), so the SDK's arrays need no Objective-C runtime binding.
+#[cfg(target_vendor = "apple")]
+mod cf {
+    use core::ffi::c_void;
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        // `CFArrayCallBacks`; only its address is used.
+        static kCFTypeArrayCallBacks: u8;
+        fn CFArrayCreate(
+            allocator: *const c_void,
+            values: *const *const c_void,
+            num_values: isize,
+            callbacks: *const c_void,
+        ) -> *const c_void;
+        fn CFRetain(cf: *const c_void) -> *const c_void;
+        fn CFRelease(cf: *const c_void);
+    }
+
+    /// One reference to a CoreFoundation / Objective-C object (or null),
+    /// released on drop.
+    pub(super) struct Retained(*const c_void);
+
+    // SAFETY: CFRetain / CFRelease are thread-safe, and nothing else is done
+    // with the object through this handle.
+    unsafe impl Send for Retained {}
+    unsafe impl Sync for Retained {}
+
+    impl Retained {
+        /// A one-element `NSArray` holding (and retaining) `object`; null for null.
+        pub(super) fn array_of_one(object: *mut c_void) -> Self {
+            if object.is_null() {
+                return Self(core::ptr::null());
+            }
+            let values = [object as *const c_void];
+            // SAFETY: one valid element; `kCFTypeArrayCallBacks` retains it for
+            // the array's lifetime. The create rule hands over the one reference.
+            Self(unsafe { CFArrayCreate(core::ptr::null(), values.as_ptr(), 1, &raw const kCFTypeArrayCallBacks as _) })
+        }
+
+        /// A new reference to `object` (null stays null).
+        ///
+        /// # Safety
+        /// `object` must be null or a live CoreFoundation / Objective-C object.
+        pub(super) unsafe fn retain(object: *mut c_void) -> Self {
+            if object.is_null() {
+                return Self(core::ptr::null());
+            }
+            Self(unsafe { CFRetain(object) })
+        }
+
+        pub(super) fn as_ptr(&self) -> *mut c_void {
+            self.0 as *mut c_void
+        }
+    }
+
+    impl Drop for Retained {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { CFRelease(self.0) }
+            }
+        }
+    }
+}
+
 /// Owned Metal init descriptor — handed to
 /// [`CrmSdkLibrary::initialize_with_metal`]. macOS only.
 #[cfg(target_vendor = "apple")]
 pub struct CrmMetalInit {
     raw: MtlObject,
+    /// The two arrays `raw` points at.
+    _arrays: [cf::Retained; 2],
 }
 
 #[cfg(target_vendor = "apple")]
@@ -829,16 +906,19 @@ unsafe impl Send for CrmMetalInit {}
 
 #[cfg(target_vendor = "apple")]
 impl CrmMetalInit {
+    /// `device` is an `id<MTLDevice>`, `command_queue` an `id<MTLCommandQueue>`
+    /// on it (or null, for queues of the SDK's own). Both are retained.
     pub fn new(device: *mut core::ffi::c_void, command_queue: *mut core::ffi::c_void) -> Self {
-        // `MtlObject::device_ids` is a single pointer (not a pointer
-        // array) per the SDK's `CrmSdkTypes.h`. Same for
-        // `command_queue` — both are scalar Objective-C handles.
+        // The SDK takes ARRAYS here (see `MtlObject`). Handed the bare
+        // `id<MTLDevice>`, `CrmInitializeSDKWithDevice` sent it an `NSArray`
+        // message and threw `NSInvalidArgumentException` (unrecognized
+        // selector) out of `+[CrmMtlRawDeveloperObjC CrmMtlGetSystemInfo:
+        // mtlObjectRef:]` — through Rust frames, so the process aborted.
+        let devices = cf::Retained::array_of_one(device);
+        let queues = cf::Retained::array_of_one(command_queue);
         Self {
-            raw: MtlObject {
-                device_ids: device as *mut CrmVoid,
-                device_num: 1,
-                command_queue: command_queue as *mut CrmVoid,
-            },
+            raw: MtlObject { device_ids: devices.as_ptr(), device_num: 1, command_queue: queues.as_ptr() },
+            _arrays: [devices, queues],
         }
     }
 
@@ -940,8 +1020,8 @@ pub type RawProcessRef = *mut CrmVoid;
 ///
 /// The device is what decides whether a call on the ref is CUDA processing,
 /// and so whether it runs under the [`cuda_exclusion()`] of spec § 9.2.1. A
-/// plain copyable handle — it does not release itself; [`DecodeContext`] is
-/// the owning wrapper.
+/// plain copyable handle — it does not release itself; [`ProcessRefLease`]
+/// and [`DecodeContext`] are the owning wrappers.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ProcessRef {
     raw: RawProcessRef,
@@ -1515,8 +1595,9 @@ pub type CrmSetLutsDirectoryFn =
 /// none of what it is handed. So every method that passes the SDK a raw
 /// pointer, a [`ProcessRef`], or GPU handles it will use later is an
 /// `unsafe fn`, with a `# Safety` section stating what the SDK needs; the
-/// methods that take only slices and values are safe. [`DecodeContext`] and
-/// [`CrmMemory`] are the safe owning layer over the unsafe surface.
+/// methods that take only slices and values are safe. [`DecodeContext`],
+/// [`ProcessRefLease`] and [`CrmMemory`] are the safe owning layer over the
+/// unsafe surface.
 ///
 /// In the other direction, every value the SDK writes back is read as the
 /// plain integer it is — return codes, format IDs, `clSupportType`, ACES
@@ -1608,6 +1689,15 @@ pub struct CrmSdkLibrary {
     pub CrmCreateHeaderPack: dl::Symbol<CrmCreateHeaderPackFn>,
     pub CrmSetLUTsDirectory: dl::Symbol<CrmSetLutsDirectoryFn>,
 
+    /// Refs parked by dropped [`ProcessRefLease`]s; see
+    /// [`lease_process_ref`](Self::lease_process_ref).
+    idle_refs: ref_pool::IdleRefs,
+
+    /// The arrays of the installed Metal regime, held until the SDK is
+    /// terminated; see [`initialize_with_metal`](Self::initialize_with_metal).
+    #[cfg(target_vendor = "apple")]
+    metal_arrays: Mutex<Option<[cf::Retained; 2]>>,
+
     // Must be last: fields drop in declaration order, so the library stays
     // mapped until every resolved symbol above is gone.
     _lib: dl::Library,
@@ -1624,6 +1714,7 @@ impl std::fmt::Debug for CrmSdkLibrary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CrmSdkLibrary")
             .field("has_get_image_async", &self.CrmGetImageAsync.is_some())
+            .field("idle_process_refs", &self.idle_refs.len())
             .finish_non_exhaustive()
     }
 }
@@ -1801,6 +1892,9 @@ impl CrmSdkLibrary {
                 CrmCreateHeaderPack: lib.get(b"CrmCreateHeaderPack\0")?,
                 CrmSetLUTsDirectory: lib.get(b"CrmSetLUTsDirectory\0")?,
 
+                idle_refs: Default::default(),
+                #[cfg(target_vendor = "apple")]
+                metal_arrays: Mutex::new(None),
                 _lib: lib,
             })
         }
@@ -1857,15 +1951,28 @@ impl CrmSdkLibrary {
     /// `kCrmDeviceCpu | kCrmDeviceMetal`, as Canon's sample code
     /// (`TestCrmSdk.cpp`) does.
     ///
+    /// The arrays `mtl` points at are retained here until [`terminate_sdk`]
+    /// (or the library's drop), so the descriptor may be dropped right after
+    /// this call: the SDK can keep reaching its devices and queues through
+    /// them for as long as it runs.
+    ///
     /// # Safety
     ///
-    /// `mtl` must hold a live `id<MTLDevice>` and `id<MTLCommandQueue>`, and
-    /// both must stay alive until the SDK is terminated: it develops on them.
+    /// `mtl` must have the shape [`MtlObject`] documents — what
+    /// [`CrmMetalInit`] builds: an `NSArray` of `device_num` live
+    /// `id<MTLDevice>`s, and a null queue or an `NSArray` of one live
+    /// `id<MTLCommandQueue>` per device. The SDK sends `NSArray` messages to
+    /// both, and an Objective-C exception it throws aborts the process.
+    ///
+    /// [`terminate_sdk`]: Self::terminate_sdk
     #[cfg(target_vendor = "apple")]
-    #[inline]
     pub unsafe fn initialize_with_metal(&self, mtl: &mut MtlObject) -> Result<()> {
+        // SAFETY: both are null or live arrays, per the contract.
+        let arrays = unsafe { [cf::Retained::retain(mtl.device_ids), cf::Retained::retain(mtl.command_queue)] };
         let mask = Device::Cpu as CrmUInt32 | Device::Metal as CrmUInt32;
-        sdk_result(unsafe { (self.CrmInitializeSDKWithDevice)(mask, mtl as *mut _ as *mut CrmVoid) })
+        sdk_result(unsafe { (self.CrmInitializeSDKWithDevice)(mask, mtl as *mut _ as *mut CrmVoid) })?;
+        *self.metal_arrays.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(arrays);
+        Ok(())
     }
 
     /// Escape hatch for callers that already hold a `*mut CrmVoid` of the
@@ -1902,11 +2009,15 @@ impl CrmSdkLibrary {
     ///
     /// Termination frees every process ref and allocation the SDK made, so
     /// nothing made through this library may be used — or dropped — after
-    /// it: no [`DecodeContext`], [`CrmMemory`], [`ProcessRef`] or pending
-    /// async job may outlive this call.
-    #[inline]
+    /// it: no [`DecodeContext`], [`ProcessRefLease`], [`CrmMemory`],
+    /// [`ProcessRef`] or pending async job may outlive this call. The refs
+    /// parked by dropped leases are released first.
     pub unsafe fn terminate_sdk(&self) -> Result<()> {
-        sdk_result(unsafe { (self.CrmTerminateSDK)() })
+        self.release_idle_process_refs();
+        let result = sdk_result(unsafe { (self.CrmTerminateSDK)() });
+        #[cfg(target_vendor = "apple")]
+        self.metal_arrays.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        result
     }
 
     /* ── Clip identification ─────────────────────────────────────────────────────────────────── */
@@ -1983,37 +2094,51 @@ impl CrmSdkLibrary {
 
     /// Mint a decode context inside the SDK.
     ///
-    /// # Hold it. Do not mint one per decode.
+    /// Prefer [`lease_process_ref`](Self::lease_process_ref), which reuses
+    /// refs instead of releasing them — for the reason below.
     ///
-    /// A process ref is cheap on its own — creating and releasing one with no
-    /// decode in between moves neither the thread count nor the working set.
-    /// The first [`get_image`](Self::get_image) on it is not: the SDK lazily
-    /// builds a **worker pool on the ref** — measured at 76 extra OS threads and
-    /// ~2 GB of committed arena for a 6000 × 3164 clip on CRMSDK 2.10 — and
-    /// [`release_process_ref`](Self::release_process_ref) tears the whole thing
-    /// down again.
+    /// # What a ref costs, and why releasing one can crash
     ///
-    /// That teardown races. It returns before every worker it spawned has
-    /// exited, and a straggler then enters a `CRITICAL_SECTION` the release has
-    /// already deleted: an `ACCESS_VIOLATION` writing
+    /// A process ref is not cheap. `CrmCreateProcessRef` builds the ref's
+    /// **worker pool** before it returns — measured on CRMSDK 2.10 (Windows,
+    /// 32 logical CPUs) at 76 new OS threads and ~2 GB of committed memory, in
+    /// about 2 ms. The first [`get_image`](Self::get_image) adds ~150 MB more
+    /// and pages ~400 MB in; [`reset_process_ref`](Self::reset_process_ref)
+    /// keeps all of it; [`release_process_ref`](Self::release_process_ref)
+    /// tears all of it down.
+    ///
+    /// That teardown races on Windows. The release gives each worker a bounded
+    /// wait to exit, then frees the state that worker runs on whether it has
+    /// exited or not. A worker that has not yet got through thread start-up —
+    /// which is serialized process-wide by the loader, so 76 threads started
+    /// at once on a loaded machine can take most of a second — later starts
+    /// on freed memory: an `ACCESS_VIOLATION` writing
     /// `RTL_CRITICAL_SECTION_DEBUG::ContentionCount` (offset `0x24`) through a
-    /// NULLed `DebugInfo`, on a thread whose stack is entirely
-    /// `RtlUserThreadStart` → `CrmSdk.dll` → `RtlEnterCriticalSection`. It needs
-    /// contention to lose, so it presents as a rare, load-dependent crash with
-    /// no relation to the parameters of the call that preceded it — easy to
-    /// misattribute to whichever SDK call happened to run last.
+    /// NULL `DebugInfo`, on a thread whose stack is entirely
+    /// `RtlUserThreadStart` → `CrmSdk.dll` → `RtlEnterCriticalSection`, often
+    /// hundreds of milliseconds after the release returned. It presents as a
+    /// rare, load-dependent crash with no relation to the parameters of the
+    /// call that preceded it — easy to misattribute to whichever SDK call
+    /// happened to run last.
     ///
-    /// So every release after a decode is a dice roll. One ref held for the life
-    /// of a decoder is one roll; one per frame, or per test case, is one each.
-    /// [`reset_process_ref`](Self::reset_process_ref) is the between-decodes
-    /// reset that keeps the pool up and is the right call after a refused
-    /// decode. [`DecodeContext`] owns exactly one ref for its whole life for
-    /// this reason.
+    /// The window is right after creation: releasing a ref moments after
+    /// creating it, under load, crashes within a few runs, and no crash has
+    /// been observed releasing a ref that had already decoded. Neither a delay
+    /// before the release nor waiting for every worker to have been scheduled
+    /// closes it — a worker can be scheduled and still be stuck in start-up.
+    /// What does close it is not releasing: [`ProcessRefLease`] resets a ref
+    /// and parks it for reuse, and parked refs are released only when the SDK
+    /// is terminated. [`DecodeContext`] leases its ref, and decides everything
+    /// that can make its construction fail before leasing one.
+    ///
+    /// Between discontinuous decodes, and after a refused one, use
+    /// [`reset_process_ref`](Self::reset_process_ref): it keeps the ref and
+    /// its workers.
     ///
     /// The returned handle records `in_use_device`, which is what makes calls
     /// on a CUDA ref take the [`cuda_exclusion()`] (spec § 9.2.1) — this one
     /// included. Every call that takes the handle is `unsafe`, and nothing
-    /// releases it for you; [`DecodeContext`] is the owning wrapper.
+    /// releases it for you.
     #[inline]
     pub fn create_process_ref(
         &self,
@@ -2052,8 +2177,9 @@ impl CrmSdkLibrary {
     }
 
     /// Release a process ref and everything the SDK allocated for it. See
-    /// [`create_process_ref`](Self::create_process_ref) for why this should
-    /// happen once per decoder, not once per decode.
+    /// [`create_process_ref`](Self::create_process_ref) for why a
+    /// [`ProcessRefLease`], which parks its ref instead, is the better way to
+    /// be done with one.
     ///
     /// # Safety
     ///
@@ -2971,6 +3097,10 @@ impl CrmSdkLibrary {
 
 impl Drop for CrmSdkLibrary {
     fn drop(&mut self) {
+        // Nothing can lease from or park into the pool any more: every lease
+        // holds the library through an `Arc`.
+        self.release_idle_process_refs();
+        // SAFETY: as above, nothing made through the library outlives it.
         let _ = unsafe { (self.CrmTerminateSDK)() };
     }
 }

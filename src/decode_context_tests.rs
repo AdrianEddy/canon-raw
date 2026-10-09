@@ -360,19 +360,17 @@ impl Fixture<'_> {
         .expect("a full-resolution decompress of this clip")
     }
 
-    /// A CPU develop/decompress process ref, released on drop. One per
-    /// test, reused across every `decode_with` in it — the SDK is happier
-    /// with one long-lived ref than with a create/release around each
-    /// frame, which is also how `DecodeContext` itself uses it.
-    fn process_ref(&self) -> Result<ScopedProcessRef> {
-        let raw = self.s.sdk.create_process_ref(
+    /// A CPU develop/decompress process ref, leased like `DecodeContext`
+    /// leases its own: one per test, reused across every `decode_with` in
+    /// it, parked again on drop.
+    fn process_ref(&self) -> Result<ProcessRefLease> {
+        self.s.sdk.lease_process_ref(
             self.s.format_id,
             Device::Cpu,
             Gpu::NotUse,
             ProcessType::DEVELOP | ProcessType::DECOMPRESS,
             Resolution::K8,
-        )?;
-        Ok(ScopedProcessRef { sdk: self.s.sdk.clone(), raw })
+        )
     }
 
     /// One real `CrmGetImage` of frame 0 with an arbitrary `ResParamV13` —
@@ -382,7 +380,7 @@ impl Fixture<'_> {
     /// leaves the ref mid-recipe, and the next call on it must start clean.
     fn decode_with(
         &self,
-        process_ref: &ScopedProcessRef,
+        process_ref: &ProcessRefLease,
         res_param: &ResParamV13,
         bits: u32,
         samples: u32,
@@ -396,7 +394,7 @@ impl Fixture<'_> {
         // allocation of `size` bytes and `res_param` names a CPU output.
         let got = unsafe {
             self.s.sdk.get_image(
-                process_ref.raw,
+                process_ref.process_ref(),
                 dst.as_ptr(),
                 size,
                 bits,
@@ -410,20 +408,8 @@ impl Fixture<'_> {
             )
         };
         // SAFETY: as above; nothing is pending on the ref.
-        let _ = unsafe { self.s.sdk.reset_process_ref(process_ref.raw) };
+        let _ = unsafe { self.s.sdk.reset_process_ref(process_ref.process_ref()) };
         got
-    }
-}
-
-struct ScopedProcessRef {
-    sdk: Arc<CrmSdkLibrary>,
-    raw: crate::ProcessRef,
-}
-
-impl Drop for ScopedProcessRef {
-    fn drop(&mut self) {
-        // SAFETY: created by `Fixture::process_ref` and released only here.
-        let _ = unsafe { self.sdk.release_process_ref(self.raw) };
     }
 }
 
@@ -1015,7 +1001,7 @@ fn get_aces_idt_reports_the_idt_an_aces_develop_applied() {
     // the recipe names a CPU output.
     let developed = unsafe {
         fx.s.sdk.get_image(
-            pr.raw,
+            pr.process_ref(),
             dst.as_mut_ptr().cast(),
             dst.len() as u32,
             geometry.bits_per_sample,
@@ -1031,17 +1017,21 @@ fn get_aces_idt_reports_the_idt_an_aces_develop_applied() {
     developed.unwrap_or_else(|e| panic!("ACES develop: {e}: {}", fx.s.sdk.get_last_error_string().unwrap_or_default()));
 
     // SAFETY: `pr` is live, and the develop above has completed.
-    let idt = unsafe { fx.s.sdk.get_aces_idt(pr.raw) }.expect("CrmGetAcesIDT");
+    let idt = unsafe { fx.s.sdk.get_aces_idt(pr.process_ref()) }.expect("CrmGetAcesIDT");
     assert!(idt.idt().is_some(), "an IDT CrmSdkTypes.h defines: {idt:?}");
     assert!(!idt.name.is_empty() && idt.name.is_ascii(), "{idt:?}");
     // SAFETY: as above; nothing is pending on the ref.
-    let _ = unsafe { fx.s.sdk.reset_process_ref(pr.raw) };
+    let _ = unsafe { fx.s.sdk.reset_process_ref(pr.process_ref()) };
     eprintln!("decode_context: ACES develop applied {:?} ({:?})", idt.idt(), idt.name);
 }
 
 /// The SDK's half of spec § 9.2.1 against the real library: while another
 /// thread holds the CUDA exclusion, creating a CUDA process ref waits, and
 /// creating a CPU one does not — CPU processing is outside the rule.
+///
+/// Through `lease_process_ref`, so the refs are parked rather than released
+/// moments after creation. Nothing else in the suite leases a DEVELOP-only
+/// ref, so both leases really do create one.
 #[test]
 fn cuda_process_ref_calls_wait_for_the_cuda_exclusion() {
     let Some(fx) = fixture() else { return };
@@ -1051,7 +1041,7 @@ fn cuda_process_ref_calls_wait_for_the_cuda_exclusion() {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let gpu = if device == Device::Cuda { Gpu::Gpu1 } else { Gpu::NotUse };
-            let _ = tx.send(sdk.create_process_ref(format_id, device, gpu, ProcessType::DEVELOP, Resolution::K8));
+            let _ = tx.send(sdk.lease_process_ref(format_id, device, gpu, ProcessType::DEVELOP, Resolution::K8));
         });
         rx
     };
@@ -1071,18 +1061,70 @@ fn cuda_process_ref_calls_wait_for_the_cuda_exclusion() {
     drop(held);
     let cuda = cuda.recv_timeout(std::time::Duration::from_secs(120)).expect("released, so it proceeds");
 
-    // SAFETY: both refs were created above, have nothing pending, and are
-    // released once.
-    unsafe {
-        let _ = fx.s.sdk.release_process_ref(cpu);
-        match cuda {
-            Ok(pr) => {
-                assert_eq!(pr.device(), Device::Cuda);
-                let _ = fx.s.sdk.release_process_ref(pr);
-            }
-            Err(e) => {
-                eprintln!("decode_context: no CUDA process ref on this machine ({e}); the wait was still observed")
-            }
-        }
+    assert_eq!(cpu.process_ref().device(), Device::Cpu);
+    match cuda {
+        Ok(lease) => assert_eq!(lease.process_ref().device(), Device::Cuda),
+        Err(e) => eprintln!("decode_context: no CUDA process ref on this machine ({e}); the wait was still observed"),
     }
+}
+
+/// Dropping a context parks its ref, and the next context with the same
+/// parameters gets that ref back instead of a new one. This is what keeps the
+/// suite — and every caller — off the create-then-release path that crashes
+/// the Windows SDK (see `CrmSdkLibrary::create_process_ref`).
+#[test]
+fn a_dropped_contexts_ref_is_parked_and_reused_not_released() {
+    let Some(fx) = fixture() else { return };
+    let first = fx.context();
+    let leased = first.process_ref();
+    let idle = fx.s.sdk.idle_process_refs();
+
+    drop(first);
+    assert_eq!(fx.s.sdk.idle_process_refs(), idle + 1, "dropping the context must park its ref, not release it");
+
+    let second = fx.context();
+    assert_eq!(second.process_ref(), leased, "the parked ref must be the one the next context gets");
+    assert_eq!(fx.s.sdk.idle_process_refs(), idle);
+}
+
+/// Leases held at the same time never share a ref, and a lease never gets a
+/// ref created with different parameters, even when one is parked.
+#[test]
+fn leases_never_share_a_ref_or_cross_parameters() {
+    let Some(fx) = fixture() else { return };
+    let (a, b) = (fx.context(), fx.context());
+    assert_ne!(a.process_ref(), b.process_ref(), "two live contexts were handed the same ref");
+    let develop_refs = [a.process_ref(), b.process_ref()];
+
+    let decompress = fx.decompress_context();
+    assert!(!develop_refs.contains(&decompress.process_ref()), "a DECOMPRESS lease got a DEVELOP|DECOMPRESS ref");
+
+    drop((a, b));
+    let again = fx.decompress_context();
+    assert!(
+        !develop_refs.contains(&again.process_ref()),
+        "with DEVELOP|DECOMPRESS refs parked, a DECOMPRESS lease must still not get one"
+    );
+}
+
+/// A reused ref decodes exactly as it did before it was parked: the reset on
+/// parking leaves nothing of the previous holder behind.
+#[test]
+fn a_reused_ref_decodes_bit_identically() {
+    let Some(fx) = fixture() else { return };
+    let decode = |ctx: &DecodeContext| {
+        let mut dst = vec![0u8; ctx.required_output_size() as usize];
+        let written = ctx.decode_frame_cpu_into(&fx.s.frame0, &mut dst).expect("the full-resolution develop");
+        assert!(written > 0);
+        dst
+    };
+
+    let first = fx.context();
+    let leased = first.process_ref();
+    let before = decode(&first);
+    drop(first);
+
+    let second = fx.context();
+    assert_eq!(second.process_ref(), leased, "the test needs the parked ref back");
+    assert!(decode(&second) == before, "the reused ref developed different pixels");
 }

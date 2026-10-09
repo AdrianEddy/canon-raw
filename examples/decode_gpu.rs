@@ -54,7 +54,10 @@ fn main() -> Result<()> {
         .ok_or(CrmError::MissingData("no GPU the SDK supports for the requested device"))?;
     println!("{}: {w}x{h}, developing on {device:?} / {use_gpu:?}", input.display());
     let process_type = ProcessType::DEVELOP | ProcessType::DECOMPRESS;
-    let process_ref = lib.create_process_ref(format_id, device, use_gpu, process_type, Resolution::K8)?;
+    // Leased rather than created: dropping the lease parks the ref for reuse
+    // instead of releasing it (see `CrmSdkLibrary::create_process_ref`).
+    let lease = lib.lease_process_ref(format_id, device, use_gpu, process_type, Resolution::K8)?;
+    let process_ref = lease.process_ref();
 
     let dev_param = DevParamV13 {
         size: std::mem::size_of::<DevParamV13>() as _,
@@ -125,7 +128,7 @@ fn main() -> Result<()> {
     println!("wrote {out_w}x{out_h} frame {frame_no} to {}", out.display());
 
     drop(dst_buffer);
-    // SAFETY: created above, released once, with nothing pending on it.
-    unsafe { lib.release_process_ref(process_ref) }?;
+    // Nothing is pending on the ref, so the lease can park it.
+    drop(lease);
     Ok(())
 }

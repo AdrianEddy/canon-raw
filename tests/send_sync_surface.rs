@@ -2,8 +2,8 @@
 // Copyright © 2025 Adrian <adrian.eddy at gmail>
 
 //! Compile-time proof of the `Send` / `Sync` classification of the types that
-//! cross threads: the SDK handle, owned SDK memory, the decode context, the
-//! owned async future and the GPU init descriptors.
+//! cross threads: the SDK handle, process-ref leases, owned SDK memory, the
+//! decode context, the owned async future and the GPU init descriptors.
 
 use canon_raw::*;
 use static_assertions::{assert_impl_all, assert_not_impl_any};
@@ -19,6 +19,14 @@ fn crm_sdk_library_is_send_sync() {
 fn process_ref_is_a_freely_shareable_handle() {
     // A value; every use of it is an `unsafe` call with its own contract.
     assert_impl_all!(ProcessRef: Send, Sync, Copy);
+}
+
+#[test]
+fn process_ref_lease_is_send_sync() {
+    // Owns its ref until dropped, which parks it — from whichever thread
+    // drops it; sharing it hands out only the `ProcessRef` value.
+    assert_impl_all!(ProcessRefLease: Send, Sync);
+    assert_not_impl_any!(ProcessRefLease: Clone);
 }
 
 #[test]

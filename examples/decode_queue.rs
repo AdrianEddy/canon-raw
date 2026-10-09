@@ -72,7 +72,10 @@ fn main() -> Result<()> {
 
     let use_gpu = common::pick_first_supported_gpu(&lib, device).unwrap_or(Gpu::NotUse);
     let process_type = ProcessType::DEVELOP | ProcessType::DECOMPRESS;
-    let process_ref = lib.create_process_ref(format_id, device, use_gpu, process_type, Resolution::K8)?;
+    // Leased rather than created: dropping the lease parks the ref for reuse
+    // instead of releasing it (see `CrmSdkLibrary::create_process_ref`).
+    let lease = lib.lease_process_ref(format_id, device, use_gpu, process_type, Resolution::K8)?;
+    let process_ref = lease.process_ref();
 
     let dev_param = DevParamV13 {
         size: std::mem::size_of::<DevParamV13>() as _,
@@ -241,7 +244,8 @@ fn main() -> Result<()> {
     }
 
     let peak_slots = slots.len();
-    unsafe { lib.release_process_ref(process_ref) }?;
+    // The queue is drained, so the lease can park the ref.
+    drop(lease);
     // Every `CrmAllocate`d buffer goes back before `CrmTerminateSDK` tears
     // the allocator down.
     drop(slots);

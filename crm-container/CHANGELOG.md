@@ -17,5 +17,5 @@ First release on crates.io.
 - `CrmContainerError` separates `Unsupported` (not a CRX movie) from `MissingBox` /
   `Parse` (damaged).
 
-[Unreleased]: https://github.com/AdrianEddy/crm-rs/compare/crm-container-v0.2.1...HEAD
-[0.2.1]: https://github.com/AdrianEddy/crm-rs/releases/tag/crm-container-v0.2.1
+[Unreleased]: https://github.com/AdrianEddy/canon-raw/compare/crm-container-v0.2.1...HEAD
+[0.2.1]: https://github.com/AdrianEddy/canon-raw/releases/tag/crm-container-v0.2.1

@@ -157,13 +157,14 @@ fn main() -> Result<()> {
 
     // Warmup (absorbs CUDA JIT) on a CUDA develop ref.
     {
-        let r = lib.create_process_ref(
+        let lease = lib.lease_process_ref(
             format_id,
             Device::Cuda,
             gpu,
             ProcessType::DEVELOP | ProcessType::DECOMPRESS,
             Resolution::K8,
         )?;
+        let r = lease.process_ref();
         let res = res_param(
             format_id,
             w,
@@ -191,7 +192,7 @@ fn main() -> Result<()> {
                 )
             }?;
         }
-        let _ = unsafe { lib.release_process_ref(r) };
+        drop(lease);
     }
 
     // ───────────────── SYNC (single thread) ─────────────────
@@ -205,13 +206,14 @@ fn main() -> Result<()> {
         ];
         for &(d_dev, out_bt, label) in cases {
             let usegpu = if d_dev == Device::Cpu { Gpu::NotUse } else { gpu };
-            let r = lib.create_process_ref(
+            let lease = lib.lease_process_ref(
                 format_id,
                 d_dev,
                 usegpu,
                 ProcessType::DEVELOP | ProcessType::DECOMPRESS,
                 Resolution::K8,
             )?;
+            let r = lease.process_ref();
             let res =
                 res_param(format_id, w, h, DataType::CrmCompressed, DataType::RgbLutApplied, BufferType::Cpu, out_bt);
             let dst = CrmMemory::new(
@@ -264,19 +266,20 @@ fn main() -> Result<()> {
                 (n - 1) as f64 / steady.as_secs_f64()
             );
             results.push((label.to_string(), (n - 1) as f64 / steady.as_secs_f64()));
-            let _ = unsafe { lib.release_process_ref(r) };
+            drop(lease);
         }
 
         // Diagnostic: CUDA-out with a FRESH CrmAllocate'd CUDA buffer per frame
         // (vs the reused buffer above) — isolates whether reuse is the stall.
         {
-            let r = lib.create_process_ref(
+            let lease = lib.lease_process_ref(
                 format_id,
                 Device::Cuda,
                 gpu,
                 ProcessType::DEVELOP | ProcessType::DECOMPRESS,
                 Resolution::K8,
             )?;
+            let r = lease.process_ref();
             let res = res_param(
                 format_id,
                 w,
@@ -311,7 +314,7 @@ fn main() -> Result<()> {
                 t.elapsed().as_secs_f64() * 1000.0 / probe as f64,
                 probe as f64 / t.elapsed().as_secs_f64()
             );
-            let _ = unsafe { lib.release_process_ref(r) };
+            drop(lease);
         }
     }
 
@@ -321,13 +324,14 @@ fn main() -> Result<()> {
         let seq = SampleSequence::Rgba16BitLe as u32;
         for &(d_dev, label) in &[(Device::Cpu, "queue CPU-dev   CPU-out"), (Device::Cuda, "queue CUDA-dev  CPU-out")] {
             let usegpu = if d_dev == Device::Cpu { Gpu::NotUse } else { gpu };
-            let r = lib.create_process_ref(
+            let lease = lib.lease_process_ref(
                 format_id,
                 d_dev,
                 usegpu,
                 ProcessType::DEVELOP | ProcessType::DECOMPRESS,
                 Resolution::K8,
             )?;
+            let r = lease.process_ref();
             let res = res_param(
                 format_id,
                 w,
@@ -393,21 +397,18 @@ fn main() -> Result<()> {
             }
             assert_eq!(got, n);
             report(&mut results, label, t.elapsed());
-            let _ = unsafe { lib.release_process_ref(r) };
+            drop(lease);
         }
     }
 
     // ───────────────── POOL (sync CrmGetImage, CPU dev/out, K threads) ─────────────────
     //
-    // NOTE — the ref-per-worker shape below is the SDK's most dangerous, and it
-    // is here on purpose: the pool measures K *independent* consumers, and
-    // `CrmGetImage` is single-consumer per ref. But `CrmGetImage` lazily builds
-    // a ~76-thread / ~2 GB worker pool on each ref and `CrmReleaseProcessRef`
-    // tears it down without joining every worker (see the hazard note on
-    // `CrmSdkLibrary::create_process_ref`), so the five waves below perform
-    // 1+2+4+6+8 = 21 concurrent teardowns — the exact contention the race needs.
-    // If this example ever dies inside `CrmSdk.dll` with no relation to the
-    // frame it was decoding, read that note before blaming the decode.
+    // One ref per worker: the pool measures K *independent* consumers, and
+    // `CrmGetImage` is single-consumer per ref. Each ref costs ~76 threads and
+    // ~2 GB, so the refs are leased — wave k reuses the refs wave k-1 parked
+    // and creates only the extra ones, instead of tearing down and rebuilding
+    // every pool (which is also what keeps the Windows SDK's teardown race out
+    // of the picture; see `CrmSdkLibrary::create_process_ref`).
     if do_grp("pool") {
         line!("[POOL sync threads — CUDA-dev CPU-out, work-stealing]");
         for k in [1usize, 2, 4, 6, 8].into_iter().filter(|&k| k <= pool_max) {
@@ -420,13 +421,14 @@ fn main() -> Result<()> {
                     let frames = frames.clone();
                     let counter = counter.clone();
                     handles.push(s.spawn(move || -> Result<()> {
-                        let r = lib.create_process_ref(
+                        let lease = lib.lease_process_ref(
                             format_id,
                             Device::Cuda,
                             gpu,
                             ProcessType::DEVELOP | ProcessType::DECOMPRESS,
                             Resolution::K8,
                         )?;
+                        let r = lease.process_ref();
                         let res = res_param(
                             format_id,
                             w,
@@ -459,7 +461,7 @@ fn main() -> Result<()> {
                                 )
                             }?;
                         }
-                        let _ = unsafe { lib.release_process_ref(r) };
+                        drop(lease);
                         Ok(())
                     }));
                 }
@@ -486,13 +488,14 @@ fn main() -> Result<()> {
                     let frames = frames.clone();
                     let counter = counter.clone();
                     handles.push(s.spawn(move || -> Result<()> {
-                        let r = lib.create_process_ref(
+                        let lease = lib.lease_process_ref(
                             format_id,
                             Device::Cuda,
                             gpu,
                             ProcessType::DEVELOP | ProcessType::DECOMPRESS,
                             Resolution::K8,
                         )?;
+                        let r = lease.process_ref();
                         let res = res_param(
                             format_id,
                             w,
@@ -590,7 +593,7 @@ fn main() -> Result<()> {
                             }
                         }
                         let _ = (&mut ms, &mut mh);
-                        let _ = unsafe { lib.release_process_ref(r) };
+                        drop(lease);
                         Ok(())
                     }));
                 }
@@ -688,7 +691,8 @@ fn run_async_stages(
     let dbpl = OutputGeometry::bytes_per_line(dw, 16, 1);
     let dsize = dbpl * dh; // 16-bit, 1 sample bayer
     // Decompress is CPU-only (spec) — a CUDA decompress ref is rejected.
-    let dref = lib.create_process_ref(format_id, Device::Cpu, Gpu::NotUse, ProcessType::DECOMPRESS, Resolution::K8)?;
+    let dlease = lib.lease_process_ref(format_id, Device::Cpu, Gpu::NotUse, ProcessType::DECOMPRESS, Resolution::K8)?;
+    let dref = dlease.process_ref();
 
     // Per-slot pinned input/header/bayer buffers.
     let mut src: Vec<CrmMemory> =
@@ -768,6 +772,6 @@ fn run_async_stages(
         results.push((format!("async DECOMPRESS x{conc} (bayer)"), fps));
     }
     let _ = (&mut src, &mut hdr);
-    let _ = unsafe { lib.release_process_ref(dref) };
+    drop(dlease);
     Ok(())
 }

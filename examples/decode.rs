@@ -54,7 +54,10 @@ fn main() -> Result<()> {
     println!("{}: {format_id:?}, {w}x{h}, {} frames", input.display(), crm.frame_count());
 
     let process_type = ProcessType::DEVELOP | ProcessType::DECOMPRESS;
-    let process_ref = lib.create_process_ref(format_id, device, Gpu::NotUse, process_type, Resolution::K8)?;
+    // Leased rather than created: dropping the lease parks the ref for reuse
+    // instead of releasing it (see `CrmSdkLibrary::create_process_ref`).
+    let lease = lib.lease_process_ref(format_id, device, Gpu::NotUse, process_type, Resolution::K8)?;
+    let process_ref = lease.process_ref();
 
     // Development and resolution parameters for an 8-bit Rec.709 develop.
     let dev_param = DevParamV13 {
@@ -129,7 +132,7 @@ fn main() -> Result<()> {
     // Every `CrmAllocate`d buffer goes back before the SDK is torn down —
     // which happens when the last `Arc` to `lib` drops.
     drop(dst_buffer);
-    // SAFETY: created above, released once, with nothing pending on it.
-    unsafe { lib.release_process_ref(process_ref) }?;
+    // Nothing is pending on the ref, so the lease can park it.
+    drop(lease);
     Ok(())
 }
