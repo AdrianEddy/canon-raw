@@ -17,10 +17,9 @@
 //!
 //! And the LUTs the SDK loads by default — `<directory of CrmSdk.dll>/CanonLUTs`,
 //! read during `CrmInitializeSDK*` — would satisfy that develop no matter what
-//! this test then passes. That default is exactly what masked the wrong argument
-//! at every call site in this ecosystem for months. So the gate **requires** a
-//! `CrmSdk.dll` with no `CanonLUTs` beside it (the SDK zip's own
-//! `Win_Lib/x64/` layout is one) and skips otherwise, saying why.
+//! this test then passes; that default silently masks a wrong argument. So the
+//! gate **requires** a `CrmSdk.dll` with no `CanonLUTs` beside it (the SDK zip's
+//! own `Win_Lib/x64/` layout is one) and skips otherwise, saying why.
 //!
 //! ## ONE process ref, held for the whole gate — this is not a style choice
 //!
@@ -28,11 +27,10 @@
 //! `CrmResetProcessRef` between them. The obvious shape — mint a ref inside the
 //! develop helper and release it on the way out — made this binary crash **2 in
 //! 24** runs under an eight-way parallel load, always inside the SDK and always
-//! before the first line of output, which is what an earlier round of this
-//! campaign mistook for "`CrmGetOutImageSize` cannot take a degenerate crop".
+//! before the first line of output, which is easy to mistake for a problem
+//! with whichever SDK call ran last.
 //!
-//! It is neither. Measured with a vectored exception handler on the crashing
-//! process:
+//! Measured with a vectored exception handler on the crashing process:
 //!
 //! * `CrmGetImage` **lazily builds a worker pool on the process ref** — 76 extra
 //!   OS threads and ~2 GB of committed arena on this 6000 × 3164 clip, on the
@@ -57,7 +55,7 @@
 //! exactly one for its whole life.
 //!
 //! **Do not record a crash here as an SDK limitation without first ruling this
-//! out.** It has already cost this campaign one wrong verdict.
+//! out.**
 //!
 //! ## What the gate additionally establishes
 //!
@@ -70,23 +68,24 @@
 //!
 //! | env | default | what it is |
 //! |---|---|---|
+//! | `CRM_TEST_SDK_ROOT` | `<repo>/sdk/CRMSDK210/CRMSDK` | the unpacked SDK zip's `CRMSDK` folder |
 //! | `CRM_TEST_SDK_DLL` | `<sdk root>/Win_Lib/x64/CrmSdk.dll` | the library to load |
 //! | `CRM_TEST_LUTS_PARENT` | `<sdk root>` | the directory CONTAINING `CanonLUTs` |
-//! | `CRM_TEST_CLIP` | a local `sample.CRM` | any `.CRM` whose camera supports BT.2100 PQ |
+//! | `CRM_TEST_CLIP` | — | any `.CRM` whose camera supports BT.2100 PQ |
 //!
-//! Everything unset and absent ⇒ printed skip, like the crate's other
-//! SDK-touching tests.
+//! Anything required that is unset or absent ⇒ printed skip, like the crate's
+//! other SDK-touching tests.
 
 use canon_raw::crm_parser::CrmMovie;
 use canon_raw::*;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// The SDK zip as unpacked in this repo. `CanonLUTs/` lives here; the library
-/// lives one level down in `Win_Lib/x64/`, which is what makes this tree usable
-/// as the "default cannot rescue us" fixture.
-const DEFAULT_SDK_ROOT: &str = r"D:\programowanie\projekty\Rust\crm-rs\sdk\CRMSDK210\CRMSDK";
-const DEFAULT_CLIP: &str = r"D:\programowanie\projekty\Rust\oxivideo\_dev\sdks\sample.CRM";
+/// The SDK zip as unpacked into the (git-ignored) `sdk/` folder of this repo.
+/// `CanonLUTs/` lives here; the library lives two levels down in
+/// `Win_Lib/x64/`, which is what makes this tree usable as the "default cannot
+/// rescue us" fixture.
+const DEFAULT_SDK_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/sdk/CRMSDK210/CRMSDK");
 
 struct Fixture {
     dll: PathBuf,
@@ -96,7 +95,7 @@ struct Fixture {
 }
 
 impl Fixture {
-    /// The WRONG argument — the one every call site used to pass.
+    /// The WRONG argument — the `CanonLUTs` folder itself.
     fn luts_folder_itself(&self) -> PathBuf {
         self.luts_parent.join("CanonLUTs")
     }
@@ -139,7 +138,9 @@ fn fixture() -> Option<Fixture> {
         ));
     }
 
-    let clip = PathBuf::from(env_or("CRM_TEST_CLIP", DEFAULT_CLIP));
+    let Some(clip) = std::env::var_os("CRM_TEST_CLIP").map(PathBuf::from) else {
+        return skip("CRM_TEST_CLIP is not set");
+    };
     if !clip.is_file() {
         return skip(&format!("{} absent", clip.display()));
     }
@@ -192,7 +193,9 @@ struct ScopedProcessRef {
 
 impl Drop for ScopedProcessRef {
     fn drop(&mut self) {
-        let _ = self.sdk.release_process_ref(self.raw);
+        // SAFETY: created by the gate and released only here, with nothing
+        // pending on it.
+        let _ = unsafe { self.sdk.release_process_ref(self.raw) };
     }
 }
 
@@ -219,14 +222,11 @@ fn recipe(sdk: &Arc<CrmSdkLibrary>, clip: &Path) -> Result<Recipe> {
     let uuid = movie.canon_metadata_box().ok_or(CrmError::MissingData("Canon uuid box"))?.to_vec();
     let craw = movie.craw_entry().to_vec();
 
-    let header_pack = sdk.create_header_pack(&[
-        Header { header_id: HeaderId::Uuid, data: uuid.as_ptr() as *mut _, size: uuid.len() as u32 },
-        Header { header_id: HeaderId::Craw, data: craw.as_ptr() as *mut _, size: craw.len() as u32 },
-        Header { header_id: HeaderId::TimedMetadata, data: timed_meta.as_ptr() as *mut _, size: timed_meta.len() as u32 },
-    ])?;
+    let header_pack =
+        sdk.create_header_pack(&[Header::uuid(&uuid), Header::craw(&craw), Header::timed_metadata(&timed_meta)])?;
     let format_id = sdk.get_format_id(&header_pack)?;
-    let w = sdk.get_image_info::<u32>(format_id, &header_pack, ImageInfoId::CaptureWidth)?;
-    let h = sdk.get_image_info::<u32>(format_id, &header_pack, ImageInfoId::CaptureHeight)?;
+    let w = u32::from(sdk.get_image_info(format_id, &header_pack, image_info::CaptureWidth)?);
+    let h = u32::from(sdk.get_image_info(format_id, &header_pack, image_info::CaptureHeight)?);
 
     let dev_param = DevParamV13 {
         size: std::mem::size_of::<DevParamV13>() as _,
@@ -281,20 +281,25 @@ fn recipe(sdk: &Arc<CrmSdkLibrary>, clip: &Path) -> Result<Recipe> {
 /// gate can reuse the ref at all.
 fn develop_hdr_frame0(sdk: &Arc<CrmSdkLibrary>, r: &Recipe, process_ref: ProcessRef) -> Result<f64> {
     let dst = CrmMemory::new(sdk.clone(), r.size, Device::Cpu)?;
-    let written = sdk.get_image(
-        process_ref,
-        dst.as_ptr(),
-        r.size,
-        r.bits,
-        r.samples,
-        r.bytes_per_line,
-        SampleSequence::Rgb,
-        &r.frame,
-        &r.dev_param,
-        &r.res_param,
-        &r.header_pack,
-    );
-    let _ = sdk.reset_process_ref(process_ref);
+    // SAFETY: `process_ref` is the gate's live ref; `dst` is a CPU allocation
+    // of `r.size` bytes and the recipe names a CPU output.
+    let written = unsafe {
+        sdk.get_image(
+            process_ref,
+            dst.as_ptr(),
+            r.size,
+            r.bits,
+            r.samples,
+            r.bytes_per_line,
+            SampleSequence::Rgb,
+            &r.frame,
+            &r.dev_param,
+            &r.res_param,
+            &r.header_pack,
+        )
+    };
+    // SAFETY: as above; nothing is pending on the ref.
+    let _ = unsafe { sdk.reset_process_ref(process_ref) };
 
     let written = written?;
     // SAFETY: `CrmGetImage` reported `written` bytes into `dst`, which is
@@ -313,7 +318,8 @@ fn develop_hdr_frame0(sdk: &Arc<CrmSdkLibrary>, r: &Recipe, process_ref: Process
 fn set_luts_directory_wants_the_parent_of_canon_luts() {
     let Some(fx) = fixture() else { return };
 
-    let sdk = Arc::new(CrmSdkLibrary::load(fx.dll.as_path()).expect("load CrmSdk"));
+    // SAFETY: the SDK the provisioning table names.
+    let sdk = Arc::new(unsafe { CrmSdkLibrary::load(fx.dll.as_path()) }.expect("load CrmSdk"));
     sdk.initialize_sdk().expect("CrmInitializeSDK");
     let recipe = recipe(&sdk, &fx.clip).expect("read frame 0 and resolve its develop recipe");
 
@@ -348,7 +354,7 @@ fn set_luts_directory_wants_the_parent_of_canon_luts() {
         Ok(mean) => panic!(
             "a BT.2100 PQ develop SUCCEEDED (mean {mean:.4}) with the LUT directory set to `{}` and no \
              `CanonLUTs` beside the library — so `CrmSetLUTsDirectory` does NOT append the folder name \
-             after all, and this crate's docs plus every call site are wrong the other way",
+             after all, and this crate's documentation is wrong the other way",
             wrong.display()
         ),
     };
@@ -373,5 +379,9 @@ fn set_luts_directory_wants_the_parent_of_canon_luts() {
         )
     });
     assert!(mean > 0.0, "the develop produced an all-black frame (mean {mean})");
-    eprintln!("luts_directory: `{}` develops (mean {mean:.4}); `{}` does not", fx.luts_parent.display(), wrong.display());
+    eprintln!(
+        "luts_directory: `{}` develops (mean {mean:.4}); `{}` does not",
+        fx.luts_parent.display(),
+        wrong.display()
+    );
 }

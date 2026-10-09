@@ -1,44 +1,58 @@
-use std::sync::Arc;
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Develop one frame of a `.CRM` clip on a GPU (CUDA by default, or OpenCL)
+//! and read it back to the CPU as an 8-bit RGB image.
+//!
+//!   cargo run --release --example decode_gpu -- <input.CRM> \
+//!       --sdk-dll <CrmSdk> --luts-dir <dir containing CanonLUTs> \
+//!       [--device cuda|opencl] [--frame <n>] [--out frame.jpg]
+//!
+//! `--sdk-dll` / `--luts-dir` fall back to `CRM_SDK_DLL` / `CRM_LUTS_DIR`.
+//! The develop runs on the GPU, but `out_buffer_type` stays `Cpu` so the result
+//! lands in host memory; name `BufferType::Cuda` / `OpenCl` there and pass a
+//! device allocation to keep the frame on the GPU instead.
+
 use canon_raw::crm_parser::CrmMovie;
 use canon_raw::*;
+use std::path::PathBuf;
 
 mod common;
 
 fn main() -> Result<()> {
-    let f = std::fs::File::open("F:/canon/A_0002C015X250527_153335DT_CANON.CRM").unwrap();
-    let mut crm = CrmMovie::load(f).unwrap();
-    let frame = crm.read_compressed_frame(0)?;
-    let timed_meta = crm.read_timed_meta(0).unwrap();
-    let metadata_box = crm.canon_metadata_box().unwrap();
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 2 || common::has_flag(&args, "--help") {
+        eprintln!(
+            "Usage:\n  cargo run --example decode_gpu -- <input.CRM> --sdk-dll <path> \
+             --luts-dir <dir containing CanonLUTs> [--device cuda|opencl] [--frame <n>] [--out <image>]"
+        );
+        return Ok(());
+    }
+    let input = PathBuf::from(&args[1]);
+    let frame_no = common::parse_u64_arg(&args, "--frame", 0);
+    let out = common::arg_value(&args, "--out").map(PathBuf::from).unwrap_or_else(|| "frame.jpg".into());
+    let device = common::device_arg(&args, Device::Cuda);
+
+    let mut crm = CrmMovie::load(std::fs::File::open(&input)?)?;
+    let frame = crm.read_compressed_frame(frame_no)?;
+    let timed_meta = crm.read_timed_meta(frame_no)?;
+    let metadata_box = crm.canon_metadata_box().ok_or(CrmError::MissingData("Canon metadata box"))?;
     let craw_entry = crm.craw_entry();
-    //dbg!(timed_meta);
 
-	let device = Device::Cuda;
-
-	unsafe {
-		windows_sys::Win32::System::LibraryLoader::SetDefaultDllDirectories(windows_sys::Win32::System::LibraryLoader::LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | windows_sys::Win32::System::LibraryLoader::LOAD_LIBRARY_SEARCH_USER_DIRS);
-		let path = "D:\\programowanie\\projekty\\Rust\\crm-rs\\sdk\\CRMSDK210\\CRMSDK\\Win_Lib\\x64\\";
-		let wide = path.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
-		windows_sys::Win32::System::LibraryLoader::AddDllDirectory(wide.as_ptr());
-	}
-
-    let lib = Arc::new(CrmSdkLibrary::load("D:\\programowanie\\projekty\\Rust\\crm-rs\\sdk\\CRMSDK210\\CRMSDK\\Win_Lib\\x64\\CrmSdk.dll").unwrap());
-    lib.initialize_sdk().unwrap();
-	// The directory that CONTAINS `CanonLUTs` — the SDK appends the folder name.
-	lib.set_luts_directory("D:\\programowanie\\projekty\\Rust\\crm-rs\\sdk\\CRMSDK210\\CRMSDK", true).unwrap();
+    let lib = common::load_sdk(&args)?;
 
     let header_pack = lib.create_header_pack(&[
-        Header { header_id: HeaderId::Uuid, data: metadata_box.as_ptr() as *mut _, size: metadata_box.len() as u32 },
-        Header { header_id: HeaderId::Craw, data: craw_entry.as_ptr() as *mut _, size: craw_entry.len() as u32 },
-        Header { header_id: HeaderId::TimedMetadata, data: timed_meta.as_ptr() as *mut _, size: timed_meta.len() as u32 },
+        Header::uuid(metadata_box),
+        Header::craw(craw_entry),
+        Header::timed_metadata(&timed_meta),
     ])?;
 
     let format_id = lib.get_format_id(&header_pack)?;
-    let w = lib.get_image_info::<u32>(format_id, &header_pack, ImageInfoId::CaptureWidth)?;
-    let h = lib.get_image_info::<u32>(format_id, &header_pack, ImageInfoId::CaptureHeight)?;
+    let w = u32::from(lib.get_image_info(format_id, &header_pack, image_info::CaptureWidth)?);
+    let h = u32::from(lib.get_image_info(format_id, &header_pack, image_info::CaptureHeight)?);
 
-    let use_gpu = pick_first_supported_gpu(&lib, device).unwrap_or(Gpu::NotUse);
-    dbg!(&use_gpu);
+    let use_gpu = common::pick_first_supported_gpu(&lib, device)
+        .ok_or(CrmError::MissingData("no GPU the SDK supports for the requested device"))?;
+    println!("{}: {w}x{h}, developing on {device:?} / {use_gpu:?}", input.display());
     let process_type = ProcessType::DEVELOP | ProcessType::DECOMPRESS;
     let process_ref = lib.create_process_ref(format_id, device, use_gpu, process_type, Resolution::K8)?;
 
@@ -81,55 +95,37 @@ fn main() -> Result<()> {
     let samples_per_pixel = 3u32;
     let out_bytes_per_line = OutputGeometry::bytes_per_line(out_w, out_bits_per_sample, samples_per_pixel);
     let dst_buffer_size = out_bytes_per_line * out_h;
-    dbg!(&dst_buffer_size);
     let dst_buffer = CrmMemory::new(lib.clone(), dst_buffer_size, Device::Cpu)?;
 
-    let dst_data_size = lib.get_image(
-        process_ref,
-        dst_buffer.as_ptr(),
-        dst_buffer_size,
-        out_bits_per_sample,
-        samples_per_pixel,
-        out_bytes_per_line,
-        SampleSequence::Rgb,
-        &frame,
-        &dev_param,
-        &res_param,
-        &header_pack,
-    )?;
+    // SAFETY: `process_ref` is live; `dst_buffer` is a CPU allocation of
+    // `dst_buffer_size` bytes — the full output — and `res_param` names a CPU
+    // output, which the SDK writes synchronously.
+    let dst_data_size = unsafe {
+        lib.get_image(
+            process_ref,
+            dst_buffer.as_ptr(),
+            dst_buffer_size,
+            out_bits_per_sample,
+            samples_per_pixel,
+            out_bytes_per_line,
+            SampleSequence::Rgb,
+            &frame,
+            &dev_param,
+            &res_param,
+            &header_pack,
+        )
+    }?;
 
-    println!("decoded");
+    // SAFETY: `CrmGetImage` wrote `dst_data_size` bytes into `dst_buffer`,
+    // a CPU allocation of `dst_buffer_size >= dst_data_size` bytes.
+    let pixels = unsafe { std::slice::from_raw_parts(dst_buffer.as_ptr() as *const u8, dst_data_size as usize) };
+    let img = image::RgbImage::from_raw(out_w, out_h, pixels.to_vec())
+        .ok_or_else(|| CrmError::Other("the developed frame does not fill an RGB image".into()))?;
+    img.save(&out).map_err(|e| CrmError::Other(format!("failed to save {}: {e}", out.display())))?;
+    println!("wrote {out_w}x{out_h} frame {frame_no} to {}", out.display());
 
-    let src = unsafe { std::slice::from_raw_parts(dst_buffer.as_ptr() as *const u8, dst_data_size as usize) };
-    let img = image::ImageBuffer::<image::Rgb<u8>, _>::from_raw(out_w, out_h, src.to_vec())
-        .ok_or_else(|| CrmError::Other("failed to create RGB image buffer".into()))?;
-    img.save("F:/test.jpg")
-        .map_err(|e| CrmError::Other(format!("failed to save image: {e}")))?;
-
-    lib.release_process_ref(process_ref)?;
-    lib.terminate_sdk()?;
-
+    drop(dst_buffer);
+    // SAFETY: created above, released once, with nothing pending on it.
+    unsafe { lib.release_process_ref(process_ref) }?;
     Ok(())
 }
-
-fn pick_first_supported_gpu(lib: &CrmSdkLibrary, device: Device) -> Option<Gpu> {
-    let list = lib.get_gpu_info_list_with_device(device).ok()?;
-    for (idx, info) in list.iter().enumerate() {
-        if info.support == 0 {
-            continue;
-        }
-        return Some(match idx {
-            0 => Gpu::Gpu1,
-            1 => Gpu::Gpu2,
-            2 => Gpu::Gpu3,
-            3 => Gpu::Gpu4,
-            4 => Gpu::Gpu5,
-            5 => Gpu::Gpu6,
-            6 => Gpu::Gpu7,
-            7 => Gpu::Gpu8,
-            _ => break,
-        });
-    }
-    None
-}
-

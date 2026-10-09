@@ -25,15 +25,17 @@
 //!
 //! | env | default | what it is |
 //! |---|---|---|
-//! | `CRM_TEST_SDK_DLL` | `<repo>/sdk/CRMSDK210/CRMSDK/Win_Lib/x64/CrmSdk.dll` | the library to load |
-//! | `CRM_TEST_LUTS_PARENT` | `<repo>/sdk/CRMSDK210/CRMSDK` | the directory CONTAINING `CanonLUTs` |
-//! | `CRM_TEST_CLIP` | a local `sample.CRM` | any `.CRM` the SDK can develop |
+//! | `CRM_TEST_SDK_ROOT` | `<repo>/sdk/CRMSDK210/CRMSDK` | the unpacked SDK zip's `CRMSDK` folder |
+//! | `CRM_TEST_SDK_DLL` | `<sdk root>/Win_Lib/x64/CrmSdk.dll` | the library to load |
+//! | `CRM_TEST_LUTS_PARENT` | `<sdk root>` | the directory CONTAINING `CanonLUTs` |
+//! | `CRM_TEST_CLIP` | — | any `.CRM` the SDK can develop |
 
 use super::*;
 use crate::crm_parser::CrmMovie;
+use crate::image_info;
 use crate::{
-    AcesIdt, BufferType, ColorSpace, DataType, DevParamV13, FrameRendering, Gamma, ImageInfoId,
-    IsoSetting, LensSqueeze, Point, SdkError, StructId, WbGain, WbSetting,
+    AcesIdt, BufferType, ColorSpace, DataType, DevParamV13, FrameRendering, Gamma, IsoSetting, LensSqueeze, Point,
+    SdkError, StructId, WbGain, WbSetting,
 };
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -44,23 +46,19 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 
 /// A `ResParamV13` that differs from the crate's usual develop recipe only
 /// in the three fields under test.
-fn res_param(
-    debayer_setting: DebayerSetting,
-    downscale:       Downscale,
-    decode_level:    DecodeLevel,
-) -> ResParamV13 {
+fn res_param(debayer_setting: DebayerSetting, downscale: Downscale, decode_level: DecodeLevel) -> ResParamV13 {
     ResParamV13 {
-        size:            std::mem::size_of::<ResParamV13>() as u32,
-        struct_id:       StructId::ResParamV13,
-        format_id:       FormatId::MovieType1,
+        size: std::mem::size_of::<ResParamV13>() as u32,
+        struct_id: StructId::ResParamV13,
+        format_id: FormatId::MOVIE_TYPE_1,
         debayer_setting,
         downscale,
-        crop:            Rect { x: 0, y: 0, width: 6000, height: 3164 },
+        crop: Rect { x: 0, y: 0, width: 6000, height: 3164 },
         frame_rendering: FrameRendering::Alternate,
-        lens_squeeze:    LensSqueeze::Off,
-        in_data_type:    DataType::CrmCompressed,
-        in_buffer_type:  BufferType::Cpu,
-        out_data_type:   DataType::RgbLutApplied,
+        lens_squeeze: LensSqueeze::Off,
+        in_data_type: DataType::CrmCompressed,
+        in_buffer_type: BufferType::Cpu,
+        out_data_type: DataType::RgbLutApplied,
         out_buffer_type: BufferType::Cpu,
         decode_level,
     }
@@ -101,9 +99,15 @@ fn downscale_and_decode_level_never_both_scale() {
     // Every non-`X1` value scales — the RGB resamplers, the named rasters
     // and the bayer-domain pair alike.
     let scaling_downscales = [
-        Downscale::X2, Downscale::X4, Downscale::Hd, Downscale::Sd,
-        Downscale::Qfhd, Downscale::K4Dci, Downscale::K2Dci,
-        Downscale::Bayer2, Downscale::Bayer4,
+        Downscale::X2,
+        Downscale::X4,
+        Downscale::Hd,
+        Downscale::Sd,
+        Downscale::Qfhd,
+        Downscale::K4Dci,
+        Downscale::K2Dci,
+        Downscale::Bayer2,
+        Downscale::Bayer4,
     ];
     for downscale in scaling_downscales {
         // Legal: one scaler, and `Full` keeps the debayer free.
@@ -121,10 +125,16 @@ fn downscale_and_decode_level_never_both_scale() {
             );
         }
     }
-    // The measured pairs from the review, named explicitly so a regression
-    // reads as the symptom it was.
-    assert_eq!(rejection(&res_param(DebayerSetting::HighSpeed, Downscale::X2, DecodeLevel::Half)), Some(ERR_TWO_SCALERS));
-    assert_eq!(rejection(&res_param(DebayerSetting::HighSpeed, Downscale::X4, DecodeLevel::Quarter)), Some(ERR_TWO_SCALERS));
+    // The pairs measured against `CrmGetImage`, named explicitly so a
+    // regression reads as the symptom it would be.
+    assert_eq!(
+        rejection(&res_param(DebayerSetting::HighSpeed, Downscale::X2, DecodeLevel::Half)),
+        Some(ERR_TWO_SCALERS)
+    );
+    assert_eq!(
+        rejection(&res_param(DebayerSetting::HighSpeed, Downscale::X4, DecodeLevel::Quarter)),
+        Some(ERR_TWO_SCALERS)
+    );
 }
 
 /// `X1` + `Full` is the one combination with no scaler at all.
@@ -155,7 +165,8 @@ fn a_probe_for_a_reduced_rung_always_carries_a_legal_debayer() {
             let probe = probe_res_param(&base, &geometry);
             assert_eq!(probe.decode_level, level);
             assert_eq!(
-                rejection(&probe), None,
+                rejection(&probe),
+                None,
                 "a probe built from {base_debayer:?} for {level:?} must be decodable as-is"
             );
             match level {
@@ -180,11 +191,7 @@ fn a_degenerate_extent_is_refused_before_any_ffi() {
     let full = Rect { x: 0, y: 0, width: 6000, height: 3164 };
 
     // A crop edge of 1 cannot survive the SDK's even-flooring.
-    for crop in [
-        Rect { width: 1, height: 1, ..full },
-        Rect { width: 1, ..full },
-        Rect { height: 1, ..full },
-    ] {
+    for crop in [Rect { width: 1, height: 1, ..full }, Rect { width: 1, ..full }, Rect { height: 1, ..full }] {
         assert!(
             matches!(check_extent(&crop, 4), Err(CrmError::InvalidParameter(m)) if m == ERR_DEGENERATE_CROP),
             "{crop:?} has no output raster"
@@ -194,11 +201,7 @@ fn a_degenerate_extent_is_refused_before_any_ffi() {
     // A crop edge of ZERO is not degenerate — it is the SDK's own "whole
     // frame" spelling, the one `TestCrmSdk.cpp` uses for its decompress
     // pass. Refusing it would break a legal recipe.
-    for crop in [
-        Rect { x: 0, y: 0, width: 0, height: 0 },
-        Rect { width: 0, ..full },
-        Rect { height: 0, ..full },
-    ] {
+    for crop in [Rect { x: 0, y: 0, width: 0, height: 0 }, Rect { width: 0, ..full }, Rect { height: 0, ..full }] {
         assert!(check_extent(&crop, 4).is_ok(), "{crop:?} means the whole frame, not an empty one");
     }
 
@@ -251,8 +254,8 @@ fn a_probe_preserves_every_field_the_geometry_does_not_name() {
 // Tier 2 — SDK-gated
 // ─────────────────────────────────────────────────────────────────────
 
-const DEFAULT_SDK_ROOT: &str = r"D:\programowanie\projekty\Rust\crm-rs\sdk\CRMSDK210\CRMSDK";
-const DEFAULT_CLIP: &str = r"D:\programowanie\projekty\Rust\oxivideo\_dev\sdks\sample.CRM";
+/// The SDK zip as unpacked into the (git-ignored) `sdk/` folder of this repo.
+const DEFAULT_SDK_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/sdk/CRMSDK210/CRMSDK");
 
 /// Process-wide, because `CrmInitializeSDK` is: it loads ~29 MB of
 /// resources (plus the LUT folder) and is not a per-test operation.
@@ -263,18 +266,18 @@ static SHARED: OnceLock<Option<Shared>> = OnceLock::new();
 static SERIALIZE: Mutex<()> = Mutex::new(());
 
 struct Shared {
-    sdk:         Arc<CrmSdkLibrary>,
-    format_id:   FormatId,
-    uuid:        Vec<u8>,
-    craw:        Vec<u8>,
-    timed:       Vec<u8>,
+    sdk: Arc<CrmSdkLibrary>,
+    format_id: FormatId,
+    uuid: Vec<u8>,
+    craw: Vec<u8>,
+    timed: Vec<u8>,
     header_pack: Vec<u8>,
-    capture:     Rect,
-    frame0:      Vec<u8>,
+    capture: Rect,
+    frame0: Vec<u8>,
 }
 
 struct Fixture<'a> {
-    s:     &'a Shared,
+    s: &'a Shared,
     _lock: MutexGuard<'a, ()>,
 }
 
@@ -282,31 +285,31 @@ impl Fixture<'_> {
     /// The crate's usual full-resolution develop recipe for this clip.
     fn recipe(&self) -> (DevParamV13, ResParamV13, OutputGeometry) {
         let dev_param = DevParamV13 {
-            size:           std::mem::size_of::<DevParamV13>() as u32,
-            struct_id:      StructId::DevParamV13,
-            format_id:      self.s.format_id,
-            wb_setting:     WbSetting::Record,
+            size: std::mem::size_of::<DevParamV13>() as u32,
+            struct_id: StructId::DevParamV13,
+            format_id: self.s.format_id,
+            wb_setting: WbSetting::Record,
             click_wb_point: Point { x: 0, y: 0 },
-            tint:           0.0,
-            exposure:       0.0,
-            cct:            0,
-            sharpness:      0,
-            noise:          0,
-            gamma:          Gamma::Rec709,
-            wb_gain:        WbGain { r: 0, g1: 0, g2: 0, b: 0 },
-            aces_idt:       AcesIdt::Auto,
-            color_space:    ColorSpace::Bt709,
-            iso_setting:    IsoSetting::Record,
-            iso_speed:      0,
+            tint: 0.0,
+            exposure: 0.0,
+            cct: 0,
+            sharpness: 0,
+            noise: 0,
+            gamma: Gamma::Rec709,
+            wb_gain: WbGain { r: 0, g1: 0, g2: 0, b: 0 },
+            aces_idt: AcesIdt::Auto,
+            color_space: ColorSpace::Bt709,
+            iso_setting: IsoSetting::Record,
+            iso_speed: 0,
         };
         let mut res_param = res_param(DebayerSetting::HighQuality, Downscale::X1, DecodeLevel::Full);
         res_param.format_id = self.s.format_id;
         res_param.crop = self.s.capture;
         let geometry = OutputGeometry {
-            crop:              self.s.capture,
-            downscale:         Downscale::X1,
-            decode_level:      DecodeLevel::Full,
-            bits_per_sample:   16,
+            crop: self.s.capture,
+            downscale: Downscale::X1,
+            decode_level: DecodeLevel::Full,
+            bits_per_sample: 16,
             samples_per_pixel: 4,
         };
         (dev_param, res_param, geometry)
@@ -332,6 +335,31 @@ impl Fixture<'_> {
         .expect("the full-resolution recipe is the one this clip was shot at")
     }
 
+    /// A DECOMPRESS-only context — the one kind `CrmGetImageAsync` accepts —
+    /// producing the 16-bit single-channel Bayer raster.
+    fn decompress_context(&self) -> DecodeContext {
+        let (dev_param, mut res_param, mut geometry) = self.recipe();
+        res_param.out_data_type = DataType::CrmDecompressed;
+        geometry.bits_per_sample = 16;
+        geometry.samples_per_pixel = 1;
+        DecodeContext::new(
+            self.s.sdk.clone(),
+            self.s.format_id,
+            Device::Cpu,
+            Gpu::NotUse,
+            ProcessType::DECOMPRESS,
+            Resolution::K8,
+            dev_param,
+            res_param,
+            self.s.uuid.clone(),
+            self.s.craw.clone(),
+            &self.s.timed,
+            SampleSequence::Rgb,
+            geometry,
+        )
+        .expect("a full-resolution decompress of this clip")
+    }
+
     /// A CPU develop/decompress process ref, released on drop. One per
     /// test, reused across every `decode_with` in it — the SDK is happier
     /// with one long-lived ref than with a create/release around each
@@ -355,29 +383,34 @@ impl Fixture<'_> {
     fn decode_with(
         &self,
         process_ref: &ScopedProcessRef,
-        res_param:   &ResParamV13,
-        bits:        u32,
-        samples:     u32,
+        res_param: &ResParamV13,
+        bits: u32,
+        samples: u32,
     ) -> Result<u32> {
         let dev_param = self.recipe().0;
         let (w, h) = self.s.sdk.get_out_image_size(res_param, &self.s.header_pack)?;
         let bytes_per_line = OutputGeometry::bytes_per_line(w, bits, samples);
         let size = bytes_per_line.saturating_mul(h).max(4096);
         let dst = crate::CrmMemory::new(self.s.sdk.clone(), size, Device::Cpu)?;
-        let got = self.s.sdk.get_image(
-            process_ref.raw,
-            dst.as_ptr(),
-            size,
-            bits,
-            samples,
-            bytes_per_line,
-            SampleSequence::Rgba16BitLe,
-            &self.s.frame0,
-            &dev_param,
-            res_param,
-            &self.s.header_pack,
-        );
-        let _ = self.s.sdk.reset_process_ref(process_ref.raw);
+        // SAFETY: `process_ref` is live for the test; `dst` is a CPU
+        // allocation of `size` bytes and `res_param` names a CPU output.
+        let got = unsafe {
+            self.s.sdk.get_image(
+                process_ref.raw,
+                dst.as_ptr(),
+                size,
+                bits,
+                samples,
+                bytes_per_line,
+                SampleSequence::Rgba16BitLe,
+                &self.s.frame0,
+                &dev_param,
+                res_param,
+                &self.s.header_pack,
+            )
+        };
+        // SAFETY: as above; nothing is pending on the ref.
+        let _ = unsafe { self.s.sdk.reset_process_ref(process_ref.raw) };
         got
     }
 }
@@ -389,7 +422,8 @@ struct ScopedProcessRef {
 
 impl Drop for ScopedProcessRef {
     fn drop(&mut self) {
-        let _ = self.sdk.release_process_ref(self.raw);
+        // SAFETY: created by `Fixture::process_ref` and released only here.
+        let _ = unsafe { self.sdk.release_process_ref(self.raw) };
     }
 }
 
@@ -440,14 +474,17 @@ fn build_shared() -> Option<Shared> {
     if !dll.is_file() {
         return skip(&format!("{} absent", dll.display()));
     }
-    let clip = PathBuf::from(env_or("CRM_TEST_CLIP", DEFAULT_CLIP));
+    let Some(clip) = std::env::var_os("CRM_TEST_CLIP").map(PathBuf::from) else {
+        return skip("CRM_TEST_CLIP is not set");
+    };
     if !clip.is_file() {
         return skip(&format!("{} absent", clip.display()));
     }
 
     add_to_loader_search_path(dll.parent().unwrap_or(Path::new(".")));
 
-    let sdk = match CrmSdkLibrary::load(dll.as_path()) {
+    // SAFETY: the SDK the provisioning table names.
+    let sdk = match unsafe { CrmSdkLibrary::load(dll.as_path()) } {
         Ok(s) => Arc::new(s),
         Err(e) => return skip(&format!("{} did not load: {e}", dll.display())),
     };
@@ -479,30 +516,30 @@ fn build_shared() -> Option<Shared> {
     };
     let craw = movie.craw_entry().to_vec();
 
-    let headers = [
-        Header { header_id: HeaderId::Uuid,          data: uuid.as_ptr()  as *mut _, size: uuid.len()  as u32 },
-        Header { header_id: HeaderId::Craw,          data: craw.as_ptr()  as *mut _, size: craw.len()  as u32 },
-        Header { header_id: HeaderId::TimedMetadata, data: timed.as_ptr() as *mut _, size: timed.len() as u32 },
-    ];
-    let header_pack = match sdk.create_header_pack(&headers) {
-        Ok(h) => h,
-        Err(e) => return skip(&format!("CrmCreateHeaderPack: {e}")),
-    };
+    let header_pack =
+        match sdk.create_header_pack(&[Header::uuid(&uuid), Header::craw(&craw), Header::timed_metadata(&timed)]) {
+            Ok(h) => h,
+            Err(e) => return skip(&format!("CrmCreateHeaderPack: {e}")),
+        };
     let format_id = match sdk.get_format_id(&header_pack) {
         Ok(f) => f,
         Err(e) => return skip(&format!("CrmGetFormatId: {e}")),
     };
-    // `CaptureWidth` / `CaptureHeight` are `CrmUInt16` (§ 8.2.1-8.2.2).
     let (w, h) = match (
-        sdk.get_image_info::<u16>(format_id, &header_pack, ImageInfoId::CaptureWidth),
-        sdk.get_image_info::<u16>(format_id, &header_pack, ImageInfoId::CaptureHeight),
+        sdk.get_image_info(format_id, &header_pack, image_info::CaptureWidth),
+        sdk.get_image_info(format_id, &header_pack, image_info::CaptureHeight),
     ) {
         (Ok(w), Ok(h)) => (u32::from(w), u32::from(h)),
         (Err(e), _) | (_, Err(e)) => return skip(&format!("CrmGetImageInfo: {e}")),
     };
 
     Some(Shared {
-        sdk, format_id, uuid, craw, timed, header_pack,
+        sdk,
+        format_id,
+        uuid,
+        craw,
+        timed,
+        header_pack,
         capture: Rect { x: 0, y: 0, width: w, height: h },
         frame0,
     })
@@ -536,8 +573,8 @@ fn get_out_image_size_accepts_what_get_image_rejects() {
     assert!(written > 0, "the control develop wrote no bytes");
 
     for (name, debayer, downscale, level) in [
-        ("X2 + Half",          DebayerSetting::HighSpeed,   Downscale::X2, DecodeLevel::Half),
-        ("X4 + Quarter",       DebayerSetting::HighSpeed,   Downscale::X4, DecodeLevel::Quarter),
+        ("X2 + Half", DebayerSetting::HighSpeed, Downscale::X2, DecodeLevel::Half),
+        ("X4 + Quarter", DebayerSetting::HighSpeed, Downscale::X4, DecodeLevel::Quarter),
         ("HighQuality + Half", DebayerSetting::HighQuality, Downscale::X1, DecodeLevel::Half),
     ] {
         let mut p = base;
@@ -562,21 +599,22 @@ fn get_out_image_size_accepts_what_get_image_rejects() {
 
         // And our validator agrees with the library, which is the whole
         // point of it existing.
-        assert!(
-            check_res_param_pairs(&p).is_err(),
-            "{name}: the SDK refuses it but check_res_param_pairs does not"
-        );
+        assert!(check_res_param_pairs(&p).is_err(), "{name}: the SDK refuses it but check_res_param_pairs does not");
 
         eprintln!(
             "decode_context: {name}: CrmGetOutImageSize -> {probed:?}, CrmGetImage -> {}",
-            match &decoded { Ok(n) => format!("Ok({n})"), Err(e) => format!("Err({e})") }
+            match &decoded {
+                Ok(n) => format!("Ok({n})"),
+                Err(e) => format!("Err({e})"),
+            }
         );
     }
 }
 
-/// The failure scenario from the review: `set_geometry` used to return
-/// `Ok(3_555_000)` for `X2 + Half` and leave every later decode failing
-/// with nothing to restore. It must now refuse and not move.
+/// `set_geometry` must refuse a two-scaler rung like `X2 + Half` and not
+/// move. Committing it would report a buffer size (`CrmGetOutImageSize`
+/// answers for it) and leave every later decode failing with nothing to
+/// restore.
 #[test]
 fn set_geometry_refuses_a_rung_the_sdk_would_reject_and_does_not_move() {
     let Some(fx) = fixture() else { return };
@@ -589,10 +627,9 @@ fn set_geometry_refuses_a_rung_the_sdk_would_reject_and_does_not_move() {
     let before_res = *ctx.res_param();
     assert!(before_size > 0 && before_dims.0 > 0 && before_dims.1 > 0);
 
-    for (name, downscale, level) in [
-        ("X2 + Half",    Downscale::X2, DecodeLevel::Half),
-        ("X4 + Quarter", Downscale::X4, DecodeLevel::Quarter),
-    ] {
+    for (name, downscale, level) in
+        [("X2 + Half", Downscale::X2, DecodeLevel::Half), ("X4 + Quarter", Downscale::X4, DecodeLevel::Quarter)]
+    {
         let rung = OutputGeometry { downscale, decode_level: level, ..before_geometry };
 
         // The ladder query refuses it too — a UI must not advertise a step
@@ -648,11 +685,7 @@ fn a_reduced_rung_commits_and_derives_its_debayer() {
     assert_eq!(ctx.res_param().decode_level, DecodeLevel::Half);
     assert_eq!(ctx.geometry().decode_level, DecodeLevel::Half, "geometry() reads out of res_param");
     assert_eq!(size, ctx.required_output_size());
-    assert_eq!(
-        size,
-        ctx.bytes_per_line().saturating_mul(ctx.output_dimensions().1),
-        "size is pitch x height"
-    );
+    assert_eq!(size, ctx.bytes_per_line().saturating_mul(ctx.output_dimensions().1), "size is pitch x height");
 
     // The proof that the committed pair is decodable, which is what
     // `CrmGetOutImageSize` alone could not have told us.
@@ -666,8 +699,7 @@ fn a_reduced_rung_commits_and_derives_its_debayer() {
     // legal there) and restoring `HighQuality` stays the caller's move.
     ctx.set_geometry(full).expect("Full must commit");
     assert_eq!(ctx.res_param().debayer_setting, DebayerSetting::HighSpeed);
-    ctx.edit_res_param(|p| p.debayer_setting = DebayerSetting::HighQuality)
-        .expect("HighQuality is legal at Full");
+    ctx.edit_res_param(|p| p.debayer_setting = DebayerSetting::HighQuality).expect("HighQuality is legal at Full");
     assert_eq!(ctx.geometry(), full);
 }
 
@@ -692,11 +724,7 @@ fn a_degenerate_geometry_is_refused_and_does_not_move_the_context() {
             OutputGeometry { crop: Rect { x: 0, y: 0, width: 1, height: 1 }, ..ctx.geometry() },
             ERR_DEGENERATE_CROP,
         ),
-        (
-            "samples_per_pixel: 0",
-            OutputGeometry { samples_per_pixel: 0, ..ctx.geometry() },
-            ERR_EMPTY_PITCH,
-        ),
+        ("samples_per_pixel: 0", OutputGeometry { samples_per_pixel: 0, ..ctx.geometry() }, ERR_EMPTY_PITCH),
     ] {
         let err = ctx.set_geometry(geometry).expect_err(&format!("{name} must not be committable"));
         assert!(
@@ -716,11 +744,10 @@ fn a_degenerate_geometry_is_refused_and_does_not_move_the_context() {
     assert!(ctx.decode_frame_cpu_into(&fx.s.frame0, &mut dst).expect("still decodes") > 0);
 }
 
-/// The drift the review measured: `out_data_type` moves the raster, is in
-/// neither `OutputGeometry` nor any "forbidden" list, and used to be
-/// reachable through an accessor that did not re-resolve — leaving
-/// `required_output_size()` describing the RGB raster while `CrmGetImage`
-/// rendered the (larger) RAW one, which fails `MemAllocFailed`.
+/// `out_data_type` moves the raster but is not part of `OutputGeometry`, so
+/// editing it must still re-resolve. Otherwise `required_output_size()`
+/// would describe the RGB raster while `CrmGetImage` renders the (larger)
+/// RAW one, which fails `MemAllocFailed`.
 #[test]
 fn editing_out_data_type_re_resolves_the_raster() {
     let Some(fx) = fixture() else { return };
@@ -752,7 +779,7 @@ fn editing_out_data_type_re_resolves_the_raster() {
     );
 
     // And the size we now publish is one `CrmGetImage` actually accepts —
-    // the check that would have caught the stale-size `MemAllocFailed`.
+    // the check that catches a stale-size `MemAllocFailed`.
     let mut dst = vec![0u8; decompressed_size as usize];
     let written = ctx.decode_frame_cpu_into(&fx.s.frame0, &mut dst).unwrap_or_else(|e| {
         panic!(
@@ -782,8 +809,7 @@ fn editing_out_data_type_re_resolves_the_raster() {
 fn an_illegal_in_place_edit_is_rolled_back_and_the_checked_form_reports_it() {
     let Some(fx) = fixture() else { return };
     let mut ctx = fx.context();
-    ctx.set_geometry(OutputGeometry { decode_level: DecodeLevel::Half, ..ctx.geometry() })
-        .expect("Half commits");
+    ctx.set_geometry(OutputGeometry { decode_level: DecodeLevel::Half, ..ctx.geometry() }).expect("Half commits");
     let dims = ctx.output_dimensions();
     let size = ctx.required_output_size();
     assert_eq!(ctx.res_param().debayer_setting, DebayerSetting::HighSpeed);
@@ -810,7 +836,7 @@ fn an_illegal_in_place_edit_is_rolled_back_and_the_checked_form_reports_it() {
 
 /// A legal in-place edit that does NOT move the raster still goes through
 /// the funnel, and the funnel leaves everything where it was — the
-/// `out_buffer_type` case the GPU path needs and the old doc forbade.
+/// `out_buffer_type` case the GPU path needs.
 #[test]
 fn editing_out_buffer_type_is_allowed_and_leaves_the_raster_alone() {
     let Some(fx) = fixture() else { return };
@@ -820,7 +846,8 @@ fn editing_out_buffer_type_is_allowed_and_leaves_the_raster_alone() {
     for buffer_type in [BufferType::Cuda, BufferType::OpenCl, BufferType::Metal, BufferType::Cpu] {
         ctx.edit_res_param_in_place().out_buffer_type = buffer_type;
         assert_eq!(
-            ctx.res_param().out_buffer_type, buffer_type,
+            ctx.res_param().out_buffer_type,
+            buffer_type,
             "{buffer_type:?} is a legal destination domain; the edit must stick"
         );
         assert_eq!(
@@ -828,5 +855,234 @@ fn editing_out_buffer_type_is_allowed_and_leaves_the_raster_alone() {
             before,
             "{buffer_type:?} does not move the output raster"
         );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Tier 2 — what the safe and unsafe decode entry points rely on
+// ─────────────────────────────────────────────────────────────────────
+
+/// Drive `future` to completion on this thread.
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    struct Unpark(std::thread::Thread);
+    impl std::task::Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
+    let mut cx = std::task::Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    loop {
+        if let std::task::Poll::Ready(out) = future.as_mut().poll(&mut cx) {
+            return out;
+        }
+        std::thread::park();
+    }
+}
+
+/// `decode_frame_cpu_into` is safe because it refuses the two inputs the SDK
+/// would mishandle, before calling it: a buffer short of the output (the SDK
+/// writes nothing and reports success) and a recipe whose output is not CPU
+/// memory (the SDK would treat the slice as a device handle).
+#[test]
+fn decode_frame_cpu_into_refuses_what_the_sdk_would_mishandle() {
+    let Some(fx) = fixture() else { return };
+    let mut ctx = fx.context();
+    let size = ctx.required_output_size() as usize;
+
+    let err = ctx
+        .decode_frame_cpu_into(&fx.s.frame0, &mut vec![0u8; size - 1])
+        .expect_err("a destination one byte short must be refused");
+    assert!(matches!(err, CrmError::BufferTooSmall { needed, got } if needed == size && got == size - 1), "{err:?}");
+
+    ctx.edit_res_param_in_place().out_buffer_type = BufferType::Cuda;
+    let err = ctx
+        .decode_frame_cpu_into(&fx.s.frame0, &mut vec![0u8; size])
+        .expect_err("a CPU slice must not be handed over as a CUDA destination");
+    assert!(matches!(err, CrmError::InvalidParameter(m) if m == ERR_NOT_CPU_DESTINATION), "{err:?}");
+
+    // And with both right, it decodes.
+    ctx.edit_res_param_in_place().out_buffer_type = BufferType::Cpu;
+    let mut dst = vec![0u8; size];
+    assert!(ctx.decode_frame_cpu_into(&fx.s.frame0, &mut dst).expect("decodes") > 0);
+}
+
+/// The typed `image_info` keys against the real library: values that agree
+/// with what the fixture already knows, text decoded within its field, and a
+/// property `.CRM` data does not carry refused rather than read as garbage.
+#[test]
+fn image_info_reads_typed_properties_from_a_real_clip() {
+    let Some(fx) = fixture() else { return };
+    let (sdk, fid, hp) = (&fx.s.sdk, fx.s.format_id, &fx.s.header_pack[..]);
+
+    let width = sdk.get_image_info(fid, hp, image_info::CaptureWidth).expect("CaptureWidth");
+    assert_eq!(u32::from(width), fx.s.capture.width);
+    let raw_width = sdk.get_image_info(fid, hp, image_info::RawFrameWidth).expect("RawFrameWidth");
+    assert!(raw_width >= width, "the RAW frame includes the effective image");
+
+    let model = sdk.get_image_info(fid, hp, image_info::DeviceModelName).expect("DeviceModelName");
+    assert!(!model.is_empty() && model.len() <= 30 && model.is_ascii(), "{model:?}");
+    let shot_at = sdk.get_image_info(fid, hp, image_info::CreationDateTime).expect("CreationDateTime");
+    assert!(!shot_at.is_empty() && shot_at.len() <= 24 && shot_at.is_ascii(), "{shot_at:?}");
+    let matrix = sdk.get_image_info(fid, hp, image_info::ColorMatrix).expect("ColorMatrix");
+    assert!(matrix.iter().all(|v| v.is_finite()), "{matrix:?}");
+    let _: bool = sdk.get_image_info(fid, hp, image_info::CaptureSystemFlag).expect("CaptureSystemFlag");
+
+    let missing = sdk.get_image_info(fid, hp, image_info::TotalImageSize);
+    assert!(
+        matches!(missing, Err(CrmError::SdkError(SdkError::InvalidParameter))),
+        "TotalImageSize is not available for .CRM data: {missing:?}"
+    );
+    eprintln!("decode_context: {model}, shot {shot_at}, {width} px wide ({raw_width} raw)");
+}
+
+/// Async decode runs on a DECOMPRESS-only context and produces exactly what
+/// the synchronous path does.
+#[test]
+fn decode_frame_future_decompresses_like_the_sync_path() {
+    let Some(fx) = fixture() else { return };
+    let ctx = fx.decompress_context();
+    let size = ctx.required_output_size() as usize;
+
+    let mut sync = vec![0u8; size];
+    ctx.decode_frame_cpu_into(&fx.s.frame0, &mut sync).expect("sync decompress");
+
+    let mut dst = vec![0u8; size];
+    // SAFETY: `dst` is a CPU buffer of the full output size, the context
+    // names a CPU output, and the future is awaited here, not leaked.
+    let submitted = unsafe { ctx.decode_frame_future(&fx.s.frame0, dst.as_mut_ptr().cast(), size as u32) };
+    let out = block_on(submitted.expect("submit"))
+        .unwrap_or_else(|e| panic!("async decompress: {e}: {}", fx.s.sdk.get_last_error_string().unwrap_or_default()));
+    assert!(out.dst_data_size > 0);
+    assert!(dst == sync, "async and sync decompress differ");
+}
+
+/// Dropping a pending future waits for the SDK: by the time `drop` returns,
+/// the job has finished writing the destination. This is what lets the
+/// destination and inputs be freed right after.
+#[test]
+fn dropping_a_pending_decode_future_waits_for_the_job() {
+    let Some(fx) = fixture() else { return };
+    let ctx = fx.decompress_context();
+    let size = ctx.required_output_size() as usize;
+
+    let mut sync = vec![0u8; size];
+    ctx.decode_frame_cpu_into(&fx.s.frame0, &mut sync).expect("sync decompress");
+
+    let mut dst = vec![0u8; size];
+    // SAFETY: as above; the future is dropped, not leaked.
+    let future =
+        unsafe { ctx.decode_frame_future(&fx.s.frame0, dst.as_mut_ptr().cast(), size as u32) }.expect("submit");
+    drop(future);
+    assert!(dst == sync, "drop returned before the SDK finished writing the destination");
+}
+
+/// The SDK refuses `CrmGetImageAsync` on a combined `DEVELOP | DECOMPRESS`
+/// ref ("CrmGetImageAsync can execute either decompress or develop processing
+/// asynchronously."). Pinned so a future SDK that lifts the restriction is
+/// noticed, and the docs updated with it.
+#[test]
+fn decode_frame_future_is_refused_on_a_combined_context() {
+    let Some(fx) = fixture() else { return };
+    let ctx = fx.context();
+    let size = ctx.required_output_size() as usize;
+    let mut dst = vec![0u8; size];
+    // SAFETY: `dst` is a CPU buffer of the full output size; a refused
+    // submission starts no job.
+    let refused = unsafe { ctx.decode_frame_future(&fx.s.frame0, dst.as_mut_ptr().cast(), size as u32) };
+    assert!(
+        matches!(refused, Err(CrmError::SdkError(SdkError::InvalidParameter))),
+        "CRMSDK 2.10 runs async decode on single-stage refs only: {refused:?}"
+    );
+}
+
+/// `get_aces_idt` reads the applied IDT as a raw value plus its name, after
+/// an ACES develop selected one automatically.
+#[test]
+fn get_aces_idt_reports_the_idt_an_aces_develop_applied() {
+    let Some(fx) = fixture() else { return };
+    let pr = fx.process_ref().expect("CrmCreateProcessRef(CPU, DEVELOP|DECOMPRESS)");
+    let (mut dev_param, res_param, geometry) = fx.recipe();
+    dev_param.color_space = ColorSpace::Aces;
+    dev_param.gamma = Gamma::Linear;
+    dev_param.aces_idt = AcesIdt::Auto;
+
+    let (w, h) = fx.s.sdk.get_out_image_size(&res_param, &fx.s.header_pack).expect("out size");
+    let bpl = OutputGeometry::bytes_per_line(w, geometry.bits_per_sample, geometry.samples_per_pixel);
+    let mut dst = vec![0u8; (bpl * h) as usize];
+    // SAFETY: `pr` is live; `dst` is a CPU buffer of the full output size and
+    // the recipe names a CPU output.
+    let developed = unsafe {
+        fx.s.sdk.get_image(
+            pr.raw,
+            dst.as_mut_ptr().cast(),
+            dst.len() as u32,
+            geometry.bits_per_sample,
+            geometry.samples_per_pixel,
+            bpl,
+            SampleSequence::Rgba16BitLe,
+            &fx.s.frame0,
+            &dev_param,
+            &res_param,
+            &fx.s.header_pack,
+        )
+    };
+    developed.unwrap_or_else(|e| panic!("ACES develop: {e}: {}", fx.s.sdk.get_last_error_string().unwrap_or_default()));
+
+    // SAFETY: `pr` is live, and the develop above has completed.
+    let idt = unsafe { fx.s.sdk.get_aces_idt(pr.raw) }.expect("CrmGetAcesIDT");
+    assert!(idt.idt().is_some(), "an IDT CrmSdkTypes.h defines: {idt:?}");
+    assert!(!idt.name.is_empty() && idt.name.is_ascii(), "{idt:?}");
+    // SAFETY: as above; nothing is pending on the ref.
+    let _ = unsafe { fx.s.sdk.reset_process_ref(pr.raw) };
+    eprintln!("decode_context: ACES develop applied {:?} ({:?})", idt.idt(), idt.name);
+}
+
+/// The SDK's half of spec § 9.2.1 against the real library: while another
+/// thread holds the CUDA exclusion, creating a CUDA process ref waits, and
+/// creating a CPU one does not — CPU processing is outside the rule.
+#[test]
+fn cuda_process_ref_calls_wait_for_the_cuda_exclusion() {
+    let Some(fx) = fixture() else { return };
+    let (sdk, format_id) = (fx.s.sdk.clone(), fx.s.format_id);
+    let create_on = |device: Device| {
+        let sdk = sdk.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let gpu = if device == Device::Cuda { Gpu::Gpu1 } else { Gpu::NotUse };
+            let _ = tx.send(sdk.create_process_ref(format_id, device, gpu, ProcessType::DEVELOP, Resolution::K8));
+        });
+        rx
+    };
+
+    let held = crate::cuda_exclusion();
+
+    let cpu = create_on(Device::Cpu)
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("a CPU process ref must not wait for the CUDA exclusion")
+        .expect("CrmCreateProcessRef(CPU)");
+
+    let cuda = create_on(Device::Cuda);
+    assert!(
+        cuda.recv_timeout(std::time::Duration::from_millis(500)).is_err(),
+        "CrmCreateProcessRef(CUDA) ran while another thread held the CUDA exclusion"
+    );
+    drop(held);
+    let cuda = cuda.recv_timeout(std::time::Duration::from_secs(120)).expect("released, so it proceeds");
+
+    // SAFETY: both refs were created above, have nothing pending, and are
+    // released once.
+    unsafe {
+        let _ = fx.s.sdk.release_process_ref(cpu);
+        match cuda {
+            Ok(pr) => {
+                assert_eq!(pr.device(), Device::Cuda);
+                let _ = fx.s.sdk.release_process_ref(pr);
+            }
+            Err(e) => {
+                eprintln!("decode_context: no CUDA process ref on this machine ({e}); the wait was still observed")
+            }
+        }
     }
 }

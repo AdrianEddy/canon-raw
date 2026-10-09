@@ -1,0 +1,38 @@
+# cargo-deny configuration — https://embarkstudios.github.io/cargo-deny/
+# Run locally with `cargo deny check`.
+
+[graph]
+all-features = true
+
+[advisories]
+# Every advisory in the RustSec database is an error unless listed here, with
+# a reason, under `ignore`.
+ignore = []
+
+[licenses]
+# Licenses compatible with distributing this workspace under MIT OR Apache-2.0.
+allow = [
+    "Apache-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Path dependencies inside this workspace carry a version too, so they are
+# not wildcards.
+allow-wildcard-paths = true
+skip = [
+    # `mp4-atom` is still on thiserror 1; this crate uses 2.
+    { crate = "thiserror@1", reason = "transitive via mp4-atom" },
+    { crate = "thiserror-impl@1", reason = "transitive via mp4-atom" },
+    { crate = "syn@2", reason = "transitive via mp4-atom's proc-macro dependencies" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -1,6 +1,16 @@
-use std::sync::Arc;
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Develop a whole `.CRM` clip through the SDK's own queue
+//! (`CrmEnqueueImage` / `CrmDequeueImage`) and write each frame as a JPEG.
+//!
+//!   cargo run --release --example decode_queue -- <input.CRM> //!       --sdk-dll <CrmSdk> --luts-dir <dir containing CanonLUTs> --out <dir> //!       [--device cpu|cuda|opencl] [--frames <n>]
+//!
+//! The queue is CPU-output only (spec § 6.3.16). See [`Slot`] for the
+//! undocumented rules the loop below has to follow.
+
 use canon_raw::crm_parser::CrmMovie;
 use canon_raw::*;
+use std::sync::Arc;
 
 mod common;
 
@@ -15,7 +25,8 @@ fn main() -> Result<()> {
     }
 
     let input = std::path::PathBuf::from(&args[1]);
-    let out_dir = std::path::PathBuf::from(common::arg_value(&args, "--out").ok_or(CrmError::InvalidParameter("--out <dir>"))?);
+    let out_dir =
+        std::path::PathBuf::from(common::arg_value(&args, "--out").ok_or(CrmError::InvalidParameter("--out <dir>"))?);
     let sdk_dll = common::arg_value(&args, "--sdk-dll")
         .or_else(|| common::env_path("CRM_SDK_DLL").map(|p| p.to_string_lossy().to_string()))
         .ok_or(CrmError::InvalidParameter("--sdk-dll <path>"))?;
@@ -41,32 +52,29 @@ fn main() -> Result<()> {
 
     let f = std::fs::File::open(&input)?;
     let mut crm = CrmMovie::load(f)?;
-    let canon_metadata_box = crm
-        .canon_metadata_box()
-        .ok_or(CrmError::MissingData("Canon metadata box"))?
-        .to_vec();
+    let canon_metadata_box = crm.canon_metadata_box().ok_or(CrmError::MissingData("Canon metadata box"))?.to_vec();
     let craw_entry = crm.craw_entry().to_vec();
 
-    let lib = Arc::new(CrmSdkLibrary::load(&sdk_dll)?);
+    let lib = Arc::new(unsafe { CrmSdkLibrary::load(&sdk_dll) }?);
     lib.initialize_sdk()?;
     lib.set_luts_directory(&luts_dir, true)?;
 
     let timed0 = crm.read_timed_meta(0)?;
     let header_pack0 = lib.create_header_pack(&[
-        Header { header_id: HeaderId::Uuid, data: canon_metadata_box.as_ptr() as *mut _, size: canon_metadata_box.len() as u32 },
-        Header { header_id: HeaderId::Craw, data: craw_entry.as_ptr() as *mut _, size: craw_entry.len() as u32 },
-        Header { header_id: HeaderId::TimedMetadata, data: timed0.as_ptr() as *mut _, size: timed0.len() as u32 },
+        Header::uuid(&canon_metadata_box),
+        Header::craw(&craw_entry),
+        Header::timed_metadata(&timed0),
     ])?;
 
     let format_id = lib.get_format_id(&header_pack0)?;
-    let w = lib.get_image_info::<u32>(format_id, &header_pack0, ImageInfoId::CaptureWidth)?;
-    let h = lib.get_image_info::<u32>(format_id, &header_pack0, ImageInfoId::CaptureHeight)?;
+    let w = u32::from(lib.get_image_info(format_id, &header_pack0, image_info::CaptureWidth)?);
+    let h = u32::from(lib.get_image_info(format_id, &header_pack0, image_info::CaptureHeight)?);
 
-    let use_gpu = pick_first_supported_gpu(&lib, device).unwrap_or(Gpu::NotUse);
+    let use_gpu = common::pick_first_supported_gpu(&lib, device).unwrap_or(Gpu::NotUse);
     let process_type = ProcessType::DEVELOP | ProcessType::DECOMPRESS;
     let process_ref = lib.create_process_ref(format_id, device, use_gpu, process_type, Resolution::K8)?;
 
-    let mut dev_param = DevParamV13 {
+    let dev_param = DevParamV13 {
         size: std::mem::size_of::<DevParamV13>() as _,
         struct_id: StructId::DevParamV13,
         format_id,
@@ -84,7 +92,7 @@ fn main() -> Result<()> {
         iso_speed: 0,
         wb_gain: WbGain { r: 0, g1: 0, g2: 0, b: 0 },
     };
-    let mut res_param = ResParamV13 {
+    let res_param = ResParamV13 {
         size: std::mem::size_of::<ResParamV13>() as _,
         struct_id: StructId::ResParamV13,
         format_id,
@@ -128,9 +136,9 @@ fn main() -> Result<()> {
             let compressed = crm.read_compressed_frame(next_enqueue)?;
             let timed = crm.read_timed_meta(next_enqueue)?;
             let header_pack = lib.create_header_pack(&[
-                Header { header_id: HeaderId::Uuid, data: canon_metadata_box.as_ptr() as *mut _, size: canon_metadata_box.len() as u32 },
-                Header { header_id: HeaderId::Craw, data: craw_entry.as_ptr() as *mut _, size: craw_entry.len() as u32 },
-                Header { header_id: HeaderId::TimedMetadata, data: timed.as_ptr() as *mut _, size: timed.len() as u32 },
+                Header::uuid(&canon_metadata_box),
+                Header::craw(&craw_entry),
+                Header::timed_metadata(&timed),
             ])?;
 
             // A slot is free only once its `inRefCon` has come back, i.e.
@@ -156,51 +164,54 @@ fn main() -> Result<()> {
             slots[slot].stage(next_enqueue, &compressed, &header_pack);
 
             let staged = &slots[slot];
-            lib.enqueue_image(
-                process_ref,
-                out_bits_per_sample,
-                samples_per_pixel,
-                out_bytes_per_line,
-                SampleSequence::Rgb as u32,
-                staged.src.as_ptr(),
-                staged.src_len,
-                &dev_param,
-                &res_param,
-                staged.ref_con(),
-                staged.hdr.as_ptr(),
-                staged.hdr_len,
-            )?;
+            unsafe {
+                lib.enqueue_image(
+                    process_ref,
+                    out_bits_per_sample,
+                    samples_per_pixel,
+                    out_bytes_per_line,
+                    SampleSequence::Rgb as u32,
+                    staged.src.as_ptr(),
+                    staged.src_len,
+                    &dev_param,
+                    &res_param,
+                    staged.ref_con(),
+                    staged.hdr.as_ptr(),
+                    staged.hdr_len,
+                )
+            }?;
             next_enqueue += 1;
         } else {
             // End-of-stream sentinel — re-sent every drain iteration
             // (requirement 3).
-            lib.enqueue_image(
-                process_ref,
-                out_bits_per_sample,
-                samples_per_pixel,
-                out_bytes_per_line,
-                SampleSequence::Rgb as u32,
-                std::ptr::null_mut(),
-                0,
-                &dev_param,
-                &res_param,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                0,
-            )?;
+            unsafe {
+                lib.enqueue_image(
+                    process_ref,
+                    out_bits_per_sample,
+                    samples_per_pixel,
+                    out_bytes_per_line,
+                    SampleSequence::Rgb as u32,
+                    std::ptr::null_mut(),
+                    0,
+                    &dev_param,
+                    &res_param,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    0,
+                )
+            }?;
         }
 
         // ── exactly ONE dequeue per iteration ────────────────────────────
-        match lib.dequeue_image(process_ref, dst_buffer.as_ptr(), dst_buffer_size) {
+        match unsafe { lib.dequeue_image(process_ref, dst_buffer.as_ptr(), dst_buffer_size) } {
             Ok((dst_data_size, out_ref_con)) => {
                 idle_polls = 0;
                 // `CrmDequeueImage` hands back the `inRefCon` of the
                 // submission that just completed. It names both the frame
                 // these pixels came from and the slot the SDK has stopped
                 // reading, so it is the one authority for recycling.
-                let tag = unsafe { (out_ref_con as *const Tag).as_ref() }.ok_or(CrmError::MissingData(
-                    "CrmDequeueImage returned a developed frame with no inRefCon",
-                ))?;
+                let tag = unsafe { (out_ref_con as *const Tag).as_ref() }
+                    .ok_or(CrmError::MissingData("CrmDequeueImage returned a developed frame with no inRefCon"))?;
                 let Tag { frame, slot } = *tag;
                 write_rgb8_jpeg(&out_dir, frame, dst_buffer.as_ptr(), dst_data_size, out_w, out_h)?;
                 outputs_written += 1;
@@ -230,12 +241,12 @@ fn main() -> Result<()> {
     }
 
     let peak_slots = slots.len();
-    lib.release_process_ref(process_ref)?;
+    unsafe { lib.release_process_ref(process_ref) }?;
     // Every `CrmAllocate`d buffer goes back before `CrmTerminateSDK` tears
     // the allocator down.
     drop(slots);
     drop(dst_buffer);
-    lib.terminate_sdk()?;
+    unsafe { lib.terminate_sdk() }?;
 
     println!("Wrote {outputs_written} frames to {} ({peak_slots} staging slots)", out_dir.display());
     Ok(())
@@ -260,15 +271,14 @@ const MAX_SLOTS: usize = 32;
 #[derive(Clone, Copy)]
 struct Tag {
     frame: u64,
-    slot:  usize,
+    slot: usize,
 }
 
 /// One in-flight submission's `CrmAllocate`d staging.
 ///
 /// The queue API's contract (CRMSDK 2.10). Requirements 1–3 are in neither
 /// the header nor the Interface Spec; all three were established
-/// empirically and are restated in full in gpu-video's
-/// `oxivideo/tests/common/crm_queue.rs`:
+/// empirically:
 ///
 ///   1. Source and header buffers must come from `CrmAllocate`
 ///      ([`CrmMemory`]) — a plain Rust `Vec` faults the SDK's worker — and
@@ -297,21 +307,21 @@ struct Tag {
 /// 38 907 threads and 9.4 GB, so the drain below bounds the poll *count*,
 /// not just wall-clock.
 struct Slot {
-    src:     CrmMemory,
-    hdr:     CrmMemory,
+    src: CrmMemory,
+    hdr: CrmMemory,
     src_len: u32,
     hdr_len: u32,
-    tag:     Box<Tag>,
+    tag: Box<Tag>,
 }
 
 impl Slot {
     fn new(lib: &Arc<CrmSdkLibrary>, src_capacity: u32, hdr_capacity: u32, index: usize) -> Result<Self> {
         Ok(Self {
-            src:     CrmMemory::new(lib.clone(), src_capacity, Device::Cpu)?,
-            hdr:     CrmMemory::new(lib.clone(), hdr_capacity, Device::Cpu)?,
+            src: CrmMemory::new(lib.clone(), src_capacity, Device::Cpu)?,
+            hdr: CrmMemory::new(lib.clone(), hdr_capacity, Device::Cpu)?,
             src_len: 0,
             hdr_len: 0,
-            tag:     Box::new(Tag { frame: 0, slot: index }),
+            tag: Box::new(Tag { frame: 0, slot: index }),
         })
     }
 
@@ -332,30 +342,6 @@ impl Slot {
     fn ref_con(&self) -> *mut CrmVoid {
         &*self.tag as *const Tag as *mut CrmVoid
     }
-}
-
-fn pick_first_supported_gpu(lib: &CrmSdkLibrary, device: Device) -> Option<Gpu> {
-    if device == Device::Cpu {
-        return None;
-    }
-    let list = lib.get_gpu_info_list_with_device(device).ok()?;
-    for (idx, info) in list.iter().enumerate() {
-        if info.support == 0 {
-            continue;
-        }
-        return Some(match idx {
-            0 => Gpu::Gpu1,
-            1 => Gpu::Gpu2,
-            2 => Gpu::Gpu3,
-            3 => Gpu::Gpu4,
-            4 => Gpu::Gpu5,
-            5 => Gpu::Gpu6,
-            6 => Gpu::Gpu7,
-            7 => Gpu::Gpu8,
-            _ => break,
-        });
-    }
-    None
 }
 
 fn write_rgb8_jpeg(

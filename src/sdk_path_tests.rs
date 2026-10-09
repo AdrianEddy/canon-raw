@@ -15,8 +15,7 @@ fn an_ascii_path_encodes_byte_for_byte() {
 }
 
 /// A path is caller data. An interior NUL truncates a C string, so it cannot be
-/// handed to the SDK — but it must come back as an error, never a panic, which
-/// is what `CString::new(..).unwrap()` used to do.
+/// handed to the SDK — but it must come back as an error, never a panic.
 #[test]
 fn an_interior_nul_is_an_error_not_a_panic() {
     let err = sdk_path_cstring(Path::new("luts\0dir")).expect_err("an interior NUL cannot be a C string");
@@ -90,7 +89,16 @@ mod ansi_code_page {
         // SAFETY: `wide` is a valid `[u16]` of `wide.len()`; a null
         // destination with size 0 is the documented length query.
         let len = unsafe {
-            WideCharToMultiByte(CP_THREAD_ACP, 0, wide.as_ptr(), wide.len() as i32, std::ptr::null_mut(), 0, std::ptr::null(), std::ptr::null_mut())
+            WideCharToMultiByte(
+                CP_THREAD_ACP,
+                0,
+                wide.as_ptr(),
+                wide.len() as i32,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            )
         };
         if len <= 0 {
             return None;
@@ -99,7 +107,16 @@ mod ansi_code_page {
         let mut used_default: i32 = 0;
         // SAFETY: `buf` has exactly the `len` bytes the query asked for.
         let written = unsafe {
-            WideCharToMultiByte(CP_THREAD_ACP, 0, wide.as_ptr(), wide.len() as i32, buf.as_mut_ptr(), len, std::ptr::null(), &mut used_default)
+            WideCharToMultiByte(
+                CP_THREAD_ACP,
+                0,
+                wide.as_ptr(),
+                wide.len() as i32,
+                buf.as_mut_ptr(),
+                len,
+                std::ptr::null(),
+                &mut used_default,
+            )
         };
         if written != len {
             return None;
@@ -118,13 +135,17 @@ mod ansi_code_page {
         }
         // SAFETY: `bytes` is a valid `[u8]` of `bytes.len()`; a null
         // destination with size 0 is the documented length query.
-        let len = unsafe { MultiByteToWideChar(CP_THREAD_ACP, 0, bytes.as_ptr(), bytes.len() as i32, std::ptr::null_mut(), 0) };
+        let len = unsafe {
+            MultiByteToWideChar(CP_THREAD_ACP, 0, bytes.as_ptr(), bytes.len() as i32, std::ptr::null_mut(), 0)
+        };
         if len <= 0 {
             return None;
         }
         let mut wide = vec![0u16; len as usize];
         // SAFETY: `wide` has exactly the `len` units the query asked for.
-        let written = unsafe { MultiByteToWideChar(CP_THREAD_ACP, 0, bytes.as_ptr(), bytes.len() as i32, wide.as_mut_ptr(), len) };
+        let written = unsafe {
+            MultiByteToWideChar(CP_THREAD_ACP, 0, bytes.as_ptr(), bytes.len() as i32, wide.as_mut_ptr(), len)
+        };
         if written != len {
             return None;
         }

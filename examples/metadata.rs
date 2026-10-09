@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Dump a `.CRM` clip's SDK header blobs (Canon `uuid` box, `CRAW` entry,
+//! per-frame timed metadata) to disk — no SDK required — and, given the SDK,
+//! print the basic image info it reads from them.
+
 use canon_raw::crm_parser::CrmMovie;
 use canon_raw::*;
 use std::path::PathBuf;
@@ -24,10 +30,7 @@ fn main() -> Result<()> {
     let f = std::fs::File::open(&input)?;
     let mut crm = CrmMovie::load(f)?;
 
-    let canon_metadata_box = crm
-        .canon_metadata_box()
-        .ok_or(CrmError::MissingData("Canon metadata box"))?
-        .to_vec();
+    let canon_metadata_box = crm.canon_metadata_box().ok_or(CrmError::MissingData("Canon metadata box"))?.to_vec();
     let craw_entry = crm.craw_entry().to_vec();
 
     std::fs::write(out_dir.join("canon_metadata_box.bin"), &canon_metadata_box)?;
@@ -44,28 +47,29 @@ fn main() -> Result<()> {
     }
 
     if let (Some(sdk_dll), Some(luts_dir)) = (
-        common::arg_value(&args, "--sdk-dll").or_else(|| common::env_path("CRM_SDK_DLL").map(|p| p.to_string_lossy().to_string())),
-        common::arg_value(&args, "--luts-dir").or_else(|| common::env_path("CRM_LUTS_DIR").map(|p| p.to_string_lossy().to_string())),
+        common::arg_value(&args, "--sdk-dll")
+            .or_else(|| common::env_path("CRM_SDK_DLL").map(|p| p.to_string_lossy().to_string())),
+        common::arg_value(&args, "--luts-dir")
+            .or_else(|| common::env_path("CRM_LUTS_DIR").map(|p| p.to_string_lossy().to_string())),
     ) {
-        if let Some(sdk_dir) = common::arg_value(&args, "--sdk-dir").map(PathBuf::from).or_else(|| PathBuf::from(&sdk_dll).parent().map(|p| p.to_path_buf())) {
+        if let Some(sdk_dir) = common::arg_value(&args, "--sdk-dir")
+            .map(PathBuf::from)
+            .or_else(|| PathBuf::from(&sdk_dll).parent().map(|p| p.to_path_buf()))
+        {
             common::add_dll_directory(&sdk_dir);
         }
 
-        let lib = CrmSdkLibrary::load(&sdk_dll)?;
+        let lib = unsafe { CrmSdkLibrary::load(&sdk_dll) }?;
         lib.initialize_sdk()?;
         lib.set_luts_directory(&luts_dir, true)?;
 
         let timed = crm.read_timed_meta(frame_no)?;
-        let headers = [
-            Header { header_id: HeaderId::Uuid, data: canon_metadata_box.as_ptr() as *mut _, size: canon_metadata_box.len() as u32 },
-            Header { header_id: HeaderId::Craw, data: craw_entry.as_ptr() as *mut _, size: craw_entry.len() as u32 },
-            Header { header_id: HeaderId::TimedMetadata, data: timed.as_ptr() as *mut _, size: timed.len() as u32 },
-        ];
+        let headers = [Header::uuid(&canon_metadata_box), Header::craw(&craw_entry), Header::timed_metadata(&timed)];
 
         let header_pack = lib.create_header_pack(&headers)?;
         let format_id = lib.get_format_id(&header_pack)?;
-        let w = lib.get_image_info::<u32>(format_id, &header_pack, ImageInfoId::CaptureWidth)?;
-        let h = lib.get_image_info::<u32>(format_id, &header_pack, ImageInfoId::CaptureHeight)?;
+        let w = u32::from(lib.get_image_info(format_id, &header_pack, image_info::CaptureWidth)?);
+        let h = u32::from(lib.get_image_info(format_id, &header_pack, image_info::CaptureHeight)?);
 
         println!("Frames: {}", crm.frame_count());
         println!("Format: {format_id:?}");
@@ -73,7 +77,9 @@ fn main() -> Result<()> {
     } else {
         println!("Frames: {}", crm.frame_count());
         println!("Wrote metadata blobs to: {}", out_dir.display());
-        println!("Tip: pass --sdk-dll and --luts-dir (or set CRM_SDK_DLL/CRM_LUTS_DIR) to extract basic image info via Canon RAW SDK.");
+        println!(
+            "Tip: pass --sdk-dll and --luts-dir (or set CRM_SDK_DLL/CRM_LUTS_DIR) to extract basic image info via Canon RAW SDK."
+        );
     }
 
     Ok(())

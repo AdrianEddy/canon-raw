@@ -1,4 +1,6 @@
-debug
-target
-sdk
-Cargo.lock
+/target/
+/debug/
+
+# Canon's SDK is not redistributable. Unpack it here for local testing only;
+# see "Testing" in the README.
+/sdk/

@@ -29,14 +29,13 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
 use crate::{
-    CrmError, CrmSdkLibrary, CrmVoid, DebayerSetting, DecodeLevel, DevParamV13, Device, Downscale,
-    FormatId, Gpu, Header, HeaderId, ProcessRef, ProcessType, Rect, ResParamV13, Resolution,
-    Result, SampleSequence,
+    BufferType, CrmError, CrmSdkLibrary, CrmVoid, DebayerSetting, DecodeLevel, DevParamV13, Device, Downscale,
+    FormatId, Gpu, Header, ProcessRef, ProcessType, Rect, ResParamV13, Resolution, Result, SampleSequence,
 };
 
 // Crate-internal gates for the private validators + the resolve/commit
-// funnel (project rule: tests never inline with the implementation). The
-// pair-constraint tables are hardware-free; the SDK sections skip with a
+// funnel, kept in their own file rather than inline with the implementation.
+// The pair-constraint tables are hardware-free; the SDK sections skip with a
 // reason when the library or a clip is absent.
 #[cfg(test)]
 #[path = "decode_context_tests.rs"]
@@ -74,10 +73,10 @@ mod tests;
 /// GPUs). It changes neither the raster nor the colour.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OutputGeometry {
-    pub crop:              Rect,
-    pub downscale:         Downscale,
-    pub decode_level:      DecodeLevel,
-    pub bits_per_sample:   u32,
+    pub crop: Rect,
+    pub downscale: Downscale,
+    pub decode_level: DecodeLevel,
+    pub bits_per_sample: u32,
     pub samples_per_pixel: u32,
 }
 
@@ -89,12 +88,12 @@ impl OutputGeometry {
     /// `data_num_in_int = 32 / bits_per_sample` samples per `i32`, so a
     /// row is `out_width * samples_per_pixel * 4 / data_num_in_int`
     /// bytes. 12-bit is the documented special case — three 12-bit
-    /// samples share two `i32`s (`* 4 * 3 / 8`). This mirrors the SDK
-    /// sample code's `out_bytes_per_line` exactly (see
-    /// `TestCrmSdk.cpp` / the crate's `examples/decode*.rs`); callers
-    /// (e.g. `gpu-video`) must compute the same value to size the
-    /// `CrmGetImage` destination buffer, so it lives here as the SDK
-    /// wrapper's canonical formula rather than being re-derived per
+    /// samples share two `i32`s (`* 4 * 3 / 8`). This mirrors the
+    /// `out_bytes_per_line` computation in Canon's sample code
+    /// (`TestCrmSdk.cpp`) exactly; see also the crate's
+    /// `examples/decode*.rs`. Every caller must compute the same value to
+    /// size the `CrmGetImage` destination buffer, so it lives here as the
+    /// SDK wrapper's canonical formula rather than being re-derived per
     /// call site.
     #[inline]
     pub const fn bytes_per_line(out_width: u32, bits_per_sample: u32, samples_per_pixel: u32) -> u32 {
@@ -103,8 +102,7 @@ impl OutputGeometry {
             out_width * samples_per_pixel * i32_bytes * 3 / 8
         } else {
             let data_num_in_int = 32 / if bits_per_sample == 0 { 1 } else { bits_per_sample };
-            out_width * samples_per_pixel * i32_bytes
-                / if data_num_in_int == 0 { 1 } else { data_num_in_int }
+            out_width * samples_per_pixel * i32_bytes / if data_num_in_int == 0 { 1 } else { data_num_in_int }
         }
     }
 }
@@ -121,10 +119,10 @@ impl OutputGeometry {
 //     X4 + Quarter         GetOutImageSize Ok( 374 x 196)   GetImage Err(InvalidParameter)
 //     HighQuality + Half   GetOutImageSize Ok(3000 x 1582)  GetImage Err(InvalidParameter)
 //
-// So the pre-check alone makes `set_geometry` "transactional" over a
-// question that rejects almost nothing: it would commit the geometry,
-// return the new size, and leave every later decode failing with no
-// previous state to go back to. The two rules below are checked here,
+// So `CrmGetOutImageSize` alone would make `set_geometry` "transactional"
+// over a question that rejects almost nothing: it would commit the
+// geometry, return the new size, and leave every later decode failing with
+// no previous state to go back to. The two rules below are checked here,
 // before anything is written.
 //
 // Sourcing: both are quoted verbatim from `CrmSdk.dll`'s own error
@@ -138,21 +136,18 @@ impl OutputGeometry {
 /// `CrmSdk.dll` error string: *"When CrmResParam::debayerSetting is 1,
 /// CrmResParam::decodeLevel must be kCrmDecodeLevel_Full."* (`1` is
 /// `kCrmDebayerSettingHighQuality`.)
-const ERR_HIGH_QUALITY_NEEDS_FULL: &str =
-    "ResParamV13: DebayerSetting::HighQuality is legal only at DecodeLevel::Full — the SDK reports \
+const ERR_HIGH_QUALITY_NEEDS_FULL: &str = "ResParamV13: DebayerSetting::HighQuality is legal only at DecodeLevel::Full — the SDK reports \
      \"When CrmResParam::debayerSetting is 1, CrmResParam::decodeLevel must be kCrmDecodeLevel_Full.\" \
      A reduced rung is a PAIR: it takes DebayerSetting::HighSpeed";
 
 /// `CrmSdk.dll` error string: *"Either CrmResParam::downscale or
 /// CrmResParam::decodeLevel must be non-scaling."*
-const ERR_TWO_SCALERS: &str =
-    "ResParamV13: at most one of Downscale / DecodeLevel may scale — they do NOT multiply, and the \
+const ERR_TWO_SCALERS: &str = "ResParamV13: at most one of Downscale / DecodeLevel may scale — they do NOT multiply, and the \
      SDK reports \"Either CrmResParam::downscale or CrmResParam::decodeLevel must be non-scaling.\" \
      Keep one of Downscale::X1 / DecodeLevel::Full";
 
 /// A crop edge of 1 — see [`check_extent`].
-const ERR_DEGENERATE_CROP: &str =
-    "OutputGeometry: a crop edge of 1 has no output raster — the SDK floors every output edge to \
+const ERR_DEGENERATE_CROP: &str = "OutputGeometry: a crop edge of 1 has no output raster — the SDK floors every output edge to \
      an even number, and the only even value at or below 1 is 0. (A crop edge of 0 is a different \
      thing and is legal: it is the SDK's own \"whole frame\" spelling.)";
 
@@ -161,16 +156,19 @@ const ERR_DEGENERATE_CROP: &str =
 /// before any FFI; [`DecodeContext::resolve`] re-checks the computed pitch
 /// afterwards for the width-dependent one (a `bits_per_sample` that packs
 /// so many samples per 32-bit word that the row divides away to nothing).
-const ERR_EMPTY_PITCH: &str =
-    "OutputGeometry: the sample layout sizes the destination at 0 bytes — samples_per_pixel is 0, \
+const ERR_EMPTY_PITCH: &str = "OutputGeometry: the sample layout sizes the destination at 0 bytes — samples_per_pixel is 0, \
      or bits_per_sample packs enough samples per 32-bit word that the resolved width divides the \
      row pitch away entirely";
+
+/// [`DecodeContext::decode_frame_cpu_into`] on a recipe whose output is not
+/// CPU memory.
+const ERR_NOT_CPU_DESTINATION: &str = "decode_frame_cpu_into: res_param.out_buffer_type is not BufferType::Cpu, so the SDK would treat \
+     the CPU buffer as a device handle — use decode_frame_to_gpu, or set out_buffer_type to Cpu";
 
 /// The backstop in [`DecodeContext::resolve`]: `CrmGetOutImageSize` can
 /// report `(0, 0)` — and return `CRM_ERR_OK` — for a recipe whose scaling
 /// leaves nothing, which is the one part of this that only it can know.
-const ERR_EMPTY_RASTER: &str =
-    "ResParamV13: the SDK resolves this crop/downscale/decode_level to an empty output raster \
+const ERR_EMPTY_RASTER: &str = "ResParamV13: the SDK resolves this crop/downscale/decode_level to an empty output raster \
      (CrmGetOutImageSize reports a zero edge and still returns CRM_ERR_OK)";
 
 /// Neither pair constraint is a preference: both are hard SDK rules, and
@@ -254,9 +252,9 @@ fn probe_res_param(base: &ResParamV13, geometry: &OutputGeometry) -> ResParamV13
 /// with nothing written yet.
 #[derive(Clone, Copy, Debug)]
 struct Resolved {
-    dims:           (u32, u32),
+    dims: (u32, u32),
     bytes_per_line: u32,
-    out_size:       u32,
+    out_size: u32,
 }
 
 /// Bundled per-decoder facade.
@@ -282,47 +280,47 @@ struct Resolved {
 ///   [`edit_res_param_in_place`](Self::edit_res_param_in_place). Both
 ///   re-resolve; both are transactional.
 pub struct DecodeContext {
-    sdk:             Arc<CrmSdkLibrary>,
-    process_ref:     ProcessRef,
+    sdk: Arc<CrmSdkLibrary>,
+    process_ref: ProcessRef,
     /// Lane the process_ref was created against. Kept for callers that
     /// need to know which memory domain `decode_frame_to_gpu`'s
     /// destination must live in; the output raster itself is
     /// device-independent (`CrmGetOutImageSize` takes no device).
-    device:          Device,
-    dev_param:       DevParamV13,
+    device: Device,
+    dev_param: DevParamV13,
     /// **The** store for the raster inputs. `crop` / `downscale` /
     /// `decode_level` live here and nowhere else —
     /// [`geometry`](DecodeContext::geometry) reads them back out — so
     /// there is no second copy to keep in sync and no way for the two to
     /// drift apart. Every write goes through
     /// [`commit_res_param`](DecodeContext::commit_res_param).
-    res_param:       ResParamV13,
+    res_param: ResParamV13,
     /// Pre-built header pack covering clip-static UUID + CRAW entry +
     /// the most-recently-set TimedMetadata. Rebuilt by
     /// [`set_timed_meta`](Self::set_timed_meta). Header-pack size does
     /// NOT affect output buffer size.
-    header_pack:     Vec<u8>,
-    uuid_box:        Vec<u8>,
-    craw_entry:      Vec<u8>,
-    format_id:       FormatId,
+    header_pack: Vec<u8>,
+    uuid_box: Vec<u8>,
+    craw_entry: Vec<u8>,
+    format_id: FormatId,
     sample_sequence: SampleSequence,
     /// Sample layout the SDK is asked to write. Not part of
     /// `ResParamV13` — `CrmGetImage` takes both as separate arguments —
     /// so it is stored here and surfaced through
     /// [`geometry`](DecodeContext::geometry).
-    bits_per_sample:   u32,
+    bits_per_sample: u32,
     samples_per_pixel: u32,
     /// Output raster the SDK reports for `res_param`
     /// (`CrmGetOutImageSize`). Not `crop / factor` — the SDK floors each
     /// edge to an even number after the division, so an odd quotient
     /// (3164 / 4 = 791) comes back one smaller (790), and it floors even
     /// at `X1`/`Full` (5999 × 3163 → 5998 × 3162).
-    out_dims:        (u32, u32),
+    out_dims: (u32, u32),
     /// Row pitch for `out_dims.0` at the active sample layout.
-    bytes_per_line:  u32,
+    bytes_per_line: u32,
     /// `bytes_per_line × out_dims.1` — the destination size to allocate
     /// for this `res_param`.
-    out_size:        u32,
+    out_size: u32,
 }
 
 // DecodeContext — Send only. Mutators take `&mut self` (the read paths
@@ -333,6 +331,21 @@ pub struct DecodeContext {
 // against a *shared* reference violate the per-decoder single-consumer
 // contract.
 unsafe impl Send for DecodeContext {}
+
+impl std::fmt::Debug for DecodeContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecodeContext")
+            .field("process_ref", &self.process_ref)
+            .field("device", &self.device)
+            .field("format_id", &self.format_id)
+            .field("sample_sequence", &self.sample_sequence)
+            .field("geometry", &self.geometry())
+            .field("out_dims", &self.out_dims)
+            .field("bytes_per_line", &self.bytes_per_line)
+            .field("out_size", &self.out_size)
+            .finish_non_exhaustive()
+    }
+}
 
 impl DecodeContext {
     /// Construct + immediately resolve the output raster.
@@ -348,19 +361,19 @@ impl DecodeContext {
     /// [`set_geometry`](Self::set_geometry) for the rules.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        sdk:                Arc<CrmSdkLibrary>,
-        format_id:          FormatId,
-        use_device:         Device,
-        use_gpu:            Gpu,
-        process_type:       ProcessType,
-        max_res:            Resolution,
-        dev_param:          DevParamV13,
-        res_param:          ResParamV13,
-        uuid_box:           Vec<u8>,
-        craw_entry:         Vec<u8>,
+        sdk: Arc<CrmSdkLibrary>,
+        format_id: FormatId,
+        use_device: Device,
+        use_gpu: Gpu,
+        process_type: ProcessType,
+        max_res: Resolution,
+        dev_param: DevParamV13,
+        res_param: ResParamV13,
+        uuid_box: Vec<u8>,
+        craw_entry: Vec<u8>,
         initial_timed_meta: &[u8],
-        sample_sequence:    SampleSequence,
-        geometry:           OutputGeometry,
+        sample_sequence: SampleSequence,
+        geometry: OutputGeometry,
     ) -> Result<Self> {
         let process_ref = sdk.create_process_ref(format_id, use_device, use_gpu, process_type, max_res)?;
         let mut header_pack = Vec::with_capacity(64 * 1024);
@@ -394,37 +407,49 @@ impl DecodeContext {
     /// is nothing here that could go stale.
     pub fn geometry(&self) -> OutputGeometry {
         OutputGeometry {
-            crop:              self.res_param.crop,
-            downscale:         self.res_param.downscale,
-            decode_level:      self.res_param.decode_level,
-            bits_per_sample:   self.bits_per_sample,
+            crop: self.res_param.crop,
+            downscale: self.res_param.downscale,
+            decode_level: self.res_param.decode_level,
+            bits_per_sample: self.bits_per_sample,
             samples_per_pixel: self.samples_per_pixel,
         }
     }
 
     /// The format id passed at construction.
-    pub fn format_id(&self) -> FormatId { self.format_id }
+    pub fn format_id(&self) -> FormatId {
+        self.format_id
+    }
 
     /// The lane the `ProcessRef` was created against — the memory domain
     /// [`decode_frame_to_gpu`](Self::decode_frame_to_gpu)'s destination
     /// has to live in. The output *raster* is device-independent
     /// (`CrmGetOutImageSize` takes no device), so nothing in the resolve
     /// consults this.
-    pub fn device(&self) -> Device { self.device }
+    pub fn device(&self) -> Device {
+        self.device
+    }
 
     /// The active sample-sequence layout (output pixel order).
-    pub fn sample_sequence(&self) -> SampleSequence { self.sample_sequence }
+    pub fn sample_sequence(&self) -> SampleSequence {
+        self.sample_sequence
+    }
 
     /// The output raster the SDK produces for the active `res_param` —
     /// `CrmGetOutImageSize`'s answer, cached at the last resolve.
-    pub fn output_dimensions(&self) -> (u32, u32) { self.out_dims }
+    pub fn output_dimensions(&self) -> (u32, u32) {
+        self.out_dims
+    }
 
     /// The output row pitch (`inBytesPerLine`) for the active raster.
-    pub fn bytes_per_line(&self) -> u32 { self.bytes_per_line }
+    pub fn bytes_per_line(&self) -> u32 {
+        self.bytes_per_line
+    }
 
     /// Cheap accessor — the destination byte count to allocate for the
     /// active raster (`bytes_per_line × output height`).
-    pub fn required_output_size(&self) -> u32 { self.out_size }
+    pub fn required_output_size(&self) -> u32 {
+        self.out_size
+    }
 
     /// The output raster this context WOULD produce for `geometry`,
     /// without applying it — the query behind a decode-scale ladder,
@@ -434,15 +459,13 @@ impl DecodeContext {
     ///
     /// Answers exactly what [`set_geometry`](Self::set_geometry) would
     /// commit, refusals included and in the same order: a rung that breaks
-    /// a pair constraint ([`check_res_param_pairs`]), has a degenerate
-    /// extent ([`check_extent`]) or resolves to an empty raster comes back
-    /// `Err` here rather than as a step the UI advertises and the decoder
-    /// then cannot serve.
+    /// a pair constraint (see [`set_geometry`](Self::set_geometry)), has a
+    /// degenerate extent (a crop edge of 1, or `samples_per_pixel: 0`) or
+    /// resolves to an empty raster comes back `Err` here rather than as a
+    /// step the UI advertises and the decoder then cannot serve.
     pub fn output_dimensions_for(&self, geometry: &OutputGeometry) -> Result<(u32, u32)> {
         let probe = probe_res_param(&self.res_param, geometry);
-        Ok(self
-            .resolve(&probe, geometry.bits_per_sample, geometry.samples_per_pixel)?
-            .dims)
+        Ok(self.resolve(&probe, geometry.bits_per_sample, geometry.samples_per_pixel)?.dims)
     }
 
     /// Update the decode rung: validate, re-resolve the output raster
@@ -479,95 +502,176 @@ impl DecodeContext {
     /// colour-transform fields (WB, exposure, gamma) that do not affect
     /// output geometry.
     pub fn set_timed_meta(&mut self, timed_meta: &[u8]) -> Result<()> {
-        Self::build_header_pack_into(
-            &self.sdk, &self.uuid_box, &self.craw_entry, timed_meta, &mut self.header_pack,
-        )
+        Self::build_header_pack_into(&self.sdk, &self.uuid_box, &self.craw_entry, timed_meta, &mut self.header_pack)
     }
 
-    /// Decode one frame to a CPU destination buffer. The bits-per-sample
-    /// / samples-per-pixel / bytes-per-line fields of the active
-    /// [`geometry`](Self::geometry) drive the layout.
+    /// Decode one frame into a CPU buffer. The bits-per-sample /
+    /// samples-per-pixel / bytes-per-line fields of the active
+    /// [`geometry`](Self::geometry) drive the layout. Returns the bytes the
+    /// SDK reports writing.
+    ///
+    /// Safe, because on the CPU path everything the SDK relies on is checked
+    /// here first:
+    ///
+    /// * `res_param().out_buffer_type` must be [`BufferType::Cpu`] — any other
+    ///   value makes the SDK treat `dst` as a device handle. Refused with
+    ///   [`CrmError::InvalidParameter`].
+    /// * `dst` must hold [`required_output_size`](Self::required_output_size)
+    ///   bytes. Refused with [`CrmError::BufferTooSmall`]: given less, the SDK
+    ///   writes nothing at all and still reports success (measured, CRMSDK
+    ///   2.10), so a short buffer would otherwise pass for a decoded frame.
     pub fn decode_frame_cpu_into(&self, compressed: &[u8], dst: &mut [u8]) -> Result<u32> {
-        self.sdk.get_image(
-            self.process_ref,
-            dst.as_mut_ptr() as *mut CrmVoid, dst.len() as u32,
-            self.bits_per_sample,
-            self.samples_per_pixel,
-            self.bytes_per_line,
-            self.sample_sequence,
-            compressed,
-            &self.dev_param,
-            &self.res_param,
-            &self.header_pack,
-        )
+        if self.res_param.out_buffer_type != BufferType::Cpu {
+            return Err(CrmError::InvalidParameter(ERR_NOT_CPU_DESTINATION));
+        }
+        self.check_destination_size(dst.len())?;
+        // SAFETY: `process_ref` is this context's live ref. `dst` is a CPU
+        // buffer, which is the domain `out_buffer_type` names, and holds at
+        // least the output size; the CPU path writes synchronously and never
+        // past the size it is given.
+        unsafe {
+            self.sdk.get_image(
+                self.process_ref,
+                dst.as_mut_ptr() as *mut CrmVoid,
+                dst.len().min(u32::MAX as usize) as u32,
+                self.bits_per_sample,
+                self.samples_per_pixel,
+                self.bytes_per_line,
+                self.sample_sequence,
+                compressed,
+                &self.dev_param,
+                &self.res_param,
+                &self.header_pack,
+            )
+        }
     }
 
-    /// Decode one frame directly into the GPU buffer `gpu_dst` of size
-    /// `gpu_dst_size` bytes. The buffer's actual memory backend must
-    /// match the lane the SDK was initialized for (CUDA / OpenCL / Metal)
-    /// **and** `res_param.out_buffer_type` must name that same lane
-    /// (the SDK's `CrmGetImage` reads `out_buffer_type` to decide whether
-    /// the destination pointer is a CPU pointer, a `CUdeviceptr`, a
-    /// `cl_mem`, or an `id<MTLBuffer>`). Set it through
-    /// [`edit_res_param`](Self::edit_res_param).
+    /// Decode one frame directly into the device buffer `gpu_dst` of
+    /// `gpu_dst_size` bytes. The buffer must live in the lane the SDK was
+    /// initialized for (CUDA / OpenCL / Metal) **and**
+    /// `res_param.out_buffer_type` must name that same lane (the SDK's
+    /// `CrmGetImage` reads `out_buffer_type` to decide whether the destination
+    /// pointer is a CPU pointer, a `CUdeviceptr`, a `cl_mem`, or an
+    /// `id<MTLBuffer>`). Set it through [`edit_res_param`](Self::edit_res_param).
     ///
     /// The compressed source is a CPU buffer — the SDK uploads/streams
-    /// it into the device internally. This is the modern path (the
+    /// it into the device internally. This is the current path (the
     /// deprecated `CrmGetImageWithGpuMemory` required a GPU source
     /// buffer too, but `CrmGetImage` with `out_buffer_type=<gpu>` and
     /// `in_buffer_type=Cpu` is functionally equivalent and the one
-    /// `TestCrmSdk.cpp` uses for every CRM clip — see the
-    /// `testCrmGetImageWithProvidedQueue` path § 1953-2367).
-    pub fn decode_frame_to_gpu(&self, compressed: &[u8], gpu_dst: *mut CrmVoid, gpu_dst_size: u32) -> Result<u32> {
-        self.sdk.get_image(
-            self.process_ref,
-            gpu_dst,
-            gpu_dst_size,
-            self.bits_per_sample,
-            self.samples_per_pixel,
-            self.bytes_per_line,
-            self.sample_sequence,
-            compressed,
-            &self.dev_param,
-            &self.res_param,
-            &self.header_pack,
-        )
+    /// Canon's sample code uses for every CRM clip — see
+    /// `testCrmGetImageWithProvidedQueue` in `TestCrmSdk.cpp`).
+    ///
+    /// A `gpu_dst_size` below [`required_output_size`](Self::required_output_size)
+    /// is refused with [`CrmError::BufferTooSmall`].
+    ///
+    /// # Safety
+    ///
+    /// * `gpu_dst` lives in the memory domain `res_param().out_buffer_type`
+    ///   names and is valid for writes of `gpu_dst_size` bytes. The SDK does
+    ///   not bound its writes by that size on a GPU destination (measured,
+    ///   CRMSDK 2.10), which is why the size check above is not optional.
+    /// * The SDK's device work can still be writing `gpu_dst` when this
+    ///   returns: keep it allocated until the stream or queue the SDK was
+    ///   initialized with has been synchronized.
+    ///
+    /// On a CUDA context the decode runs under the [`cuda_exclusion`](crate::cuda_exclusion())
+    /// (spec § 9.2.1). That synchronize is a CUDA API call of the
+    /// application's, which the same rule covers: when other threads use the
+    /// SDK, hold one guard across the decode and the synchronize.
+    ///
+    /// ```no_run
+    /// # unsafe fn f(ctx: &canon_raw::DecodeContext, frame: &[u8], dst: *mut core::ffi::c_void, size: u32) -> canon_raw::Result<()> {
+    /// let _exclusive = canon_raw::cuda_exclusion();
+    /// unsafe { ctx.decode_frame_to_gpu(frame, dst, size) }?;
+    /// // ... cuStreamSynchronize(stream) on the stream given to the SDK ...
+    /// # Ok(()) }
+    /// ```
+    pub unsafe fn decode_frame_to_gpu(
+        &self,
+        compressed: &[u8],
+        gpu_dst: *mut CrmVoid,
+        gpu_dst_size: u32,
+    ) -> Result<u32> {
+        self.check_destination_size(gpu_dst_size as usize)?;
+        // SAFETY: `process_ref` is this context's live ref, and the
+        // destination is the caller's contract, its size checked above.
+        unsafe {
+            self.sdk.get_image(
+                self.process_ref,
+                gpu_dst,
+                gpu_dst_size,
+                self.bits_per_sample,
+                self.samples_per_pixel,
+                self.bytes_per_line,
+                self.sample_sequence,
+                compressed,
+                &self.dev_param,
+                &self.res_param,
+                &self.header_pack,
+            )
+        }
     }
 
-    /// Async sibling of [`decode_frame_to_gpu`](Self::decode_frame_to_gpu):
-    /// submit the decode via `CrmGetImageAsync` and return a future that
-    /// resolves when the SDK fires its completion callback. The combined
-    /// `DEVELOP|DECOMPRESS` ref accepts up to **3** such jobs in flight; a
-    /// 4th submission fails immediately with
-    /// [`SdkError::DecompressNoResource`](crate::SdkError::DecompressNoResource)
-    /// — submit returns `Err` at the call site, not via the future.
+    /// Submit this frame through `CrmGetImageAsync` and return a future that
+    /// resolves when the SDK fires its completion callback.
+    ///
+    /// The SDK runs this only on a **DECOMPRESS-only** context: it refuses a
+    /// combined `DEVELOP | DECOMPRESS` ref and a DEVELOP-only one (measured,
+    /// CRMSDK 2.10 — see [`CrmSdkLibrary::get_image_async_raw`]). Up to
+    /// **3** jobs may be in flight; a 4th fails at submission with
+    /// [`SdkError::DecompressNoResource`](crate::SdkError::DecompressNoResource).
+    /// A `dst_size` below [`required_output_size`](Self::required_output_size)
+    /// is refused with [`CrmError::BufferTooSmall`].
     ///
     /// Borrows `self` (process ref + params + header pack) and `compressed`
-    /// for the future's whole lifetime: the SDK reads both until completion,
-    /// so neither may move while the future is pending. The header pack here
-    /// is the context's most-recently-set TimedMetadata, so concurrent
-    /// jobs all share that colour metadata — to pipeline *distinct* frames
-    /// with per-frame TimedMetadata, give each its own context or header
-    /// pack (see the gpu-video pipelining plan § 5.2).
-    pub fn decode_frame_to_gpu_future<'a>(
+    /// for the future's whole lifetime: the SDK reads both until completion.
+    /// The header pack is the context's most-recently-set TimedMetadata, so
+    /// concurrent jobs all share that metadata — to pipeline *distinct* frames,
+    /// drive [`CrmSdkLibrary::get_image_future_owned`] with a header pack per
+    /// job.
+    ///
+    /// # Safety
+    ///
+    /// * `dst` lives in the memory domain `res_param().out_buffer_type` names,
+    ///   is valid for writes of `dst_size` bytes, and stays valid until the
+    ///   future has completed or been dropped — dropping it waits for the job.
+    /// * The future must not be leaked (`mem::forget`): its `Drop` is what
+    ///   keeps the borrowed inputs alive until the SDK has finished with them.
+    pub unsafe fn decode_frame_future<'a>(
         &'a self,
-        compressed:   &'a [u8],
-        gpu_dst:      *mut CrmVoid,
-        gpu_dst_size: u32,
+        compressed: &'a [u8],
+        dst: *mut CrmVoid,
+        dst_size: u32,
     ) -> Result<crate::GetImageFuture<'a>> {
-        self.sdk.get_image_future(
-            self.process_ref,
-            gpu_dst,
-            gpu_dst_size,
-            self.bits_per_sample,
-            self.samples_per_pixel,
-            self.bytes_per_line,
-            self.sample_sequence,
-            compressed,
-            &self.dev_param,
-            &self.res_param,
-            &self.header_pack,
-        )
+        self.check_destination_size(dst_size as usize)?;
+        // SAFETY: `process_ref` is this context's live ref, the inputs are
+        // borrowed for the future's lifetime, and the destination is the
+        // caller's contract.
+        unsafe {
+            self.sdk.get_image_future(
+                self.process_ref,
+                dst,
+                dst_size,
+                self.bits_per_sample,
+                self.samples_per_pixel,
+                self.bytes_per_line,
+                self.sample_sequence,
+                compressed,
+                &self.dev_param,
+                &self.res_param,
+                &self.header_pack,
+            )
+        }
+    }
+
+    /// Refuse a destination smaller than the resolved output.
+    fn check_destination_size(&self, len: usize) -> Result<()> {
+        let needed = self.out_size as usize;
+        if len < needed {
+            return Err(CrmError::BufferTooSmall { needed, got: len });
+        }
+        Ok(())
     }
 
     /// Mutate colour-transform fields of `dev_param` (WB, exposure,
@@ -578,10 +682,14 @@ impl DecodeContext {
     /// Caller MUST NOT rewrite the structural fields (`size`,
     /// `struct_id`, `format_id`): the SDK reads them to decide which
     /// struct version it was handed.
-    pub fn dev_param_color_mut(&mut self) -> &mut DevParamV13 { &mut self.dev_param }
+    pub fn dev_param_color_mut(&mut self) -> &mut DevParamV13 {
+        &mut self.dev_param
+    }
 
     /// Read-only access to `dev_param`.
-    pub fn dev_param(&self) -> &DevParamV13 { &self.dev_param }
+    pub fn dev_param(&self) -> &DevParamV13 {
+        &self.dev_param
+    }
 
     /// Edit `res_param` and re-resolve — the **checked** form.
     ///
@@ -636,14 +744,20 @@ impl DecodeContext {
     }
 
     /// Read-only access to `res_param`.
-    pub fn res_param(&self) -> &ResParamV13 { &self.res_param }
+    pub fn res_param(&self) -> &ResParamV13 {
+        &self.res_param
+    }
 
     /// The underlying SDK handle, useful for callers that need to invoke
     /// methods outside the bundled facade.
-    pub fn sdk(&self) -> &Arc<CrmSdkLibrary> { &self.sdk }
+    pub fn sdk(&self) -> &Arc<CrmSdkLibrary> {
+        &self.sdk
+    }
 
     /// The active `ProcessRef`. Released automatically on `Drop`.
-    pub fn process_ref(&self) -> ProcessRef { self.process_ref }
+    pub fn process_ref(&self) -> ProcessRef {
+        self.process_ref
+    }
 
     /// Ask the SDK what `probe` produces, and reject what it cannot
     /// usefully produce. Touches nothing.
@@ -696,15 +810,14 @@ impl DecodeContext {
     /// § 7.3.6 gives `CrmGetOutImageSize` a width and a height and
     /// nothing else — there is no SDK call that returns a pitch or a
     /// buffer size, so both are the caller's to compute, which is what
-    /// `TestCrmSdk.cpp` does at :319-330 and what
+    /// Canon's sample code (`TestCrmSdk.cpp`) does and what
     /// [`OutputGeometry::bytes_per_line`] mirrors.
     ///
     /// `bytes_per_line × out_height` is the destination size on **every**
-    /// lane — it is what `TestCrmSdk.cpp` allocates through
+    /// lane — it is what the sample code allocates through
     /// `CrmAllocate(…, useDevice)` for CUDA / OpenCL / Metal destinations
     /// just as for CPU ones (`dstBufferSize = outBytesPerLine *
-    /// outHeight`, :2247-2254, the `testCrmGetImageWithProvidedQueue`
-    /// path).
+    /// outHeight` in `testCrmGetImageWithProvidedQueue`).
     ///
     /// What is **not** device-independent is the pitch *argument*: § 7.3.1
     /// says of `inBytesPerLine` *"If you designate a value except
@@ -716,8 +829,8 @@ impl DecodeContext {
     /// number the device allocation has to cover. Either way the size
     /// holds, which is why nothing here consults `self.device`.
     ///
-    /// The legacy per-lane `CrmPreProcessForGetImageWithGpuMemory` sizing
-    /// is gone because § 7.3.4 marks it **Deprecated** and binds it to the
+    /// `CrmPreProcessForGetImageWithGpuMemory` is deliberately not used for
+    /// sizing: § 7.3.4 marks it **Deprecated** and binds it to the
     /// deprecated `CrmGetImageWithGpuMemory` flow (§ 7.3.5) — it demands
     /// `kCrmDeviceOpenCl` and has no bearing on `CrmGetImage`.
     fn resolve(&self, probe: &ResParamV13, bits_per_sample: u32, samples_per_pixel: u32) -> Result<Resolved> {
@@ -743,14 +856,9 @@ impl DecodeContext {
     /// so every `?` above the assignments leaves `self` untouched — that
     /// is what makes `new` / `set_geometry` / `edit_res_param` /
     /// [`ResParamEdit`] transactional without each restating the
-    /// derivation (a second copy of it is exactly how the cached raster
-    /// came to be able to drift from the struct in the first place).
-    fn commit_res_param(
-        &mut self,
-        probe:             ResParamV13,
-        bits_per_sample:   u32,
-        samples_per_pixel: u32,
-    ) -> Result<u32> {
+    /// derivation (a second copy of it would be a way for the cached
+    /// raster to drift from the struct).
+    fn commit_res_param(&mut self, probe: ResParamV13, bits_per_sample: u32, samples_per_pixel: u32) -> Result<u32> {
         let resolved = self.resolve(&probe, bits_per_sample, samples_per_pixel)?;
         self.res_param = probe;
         self.bits_per_sample = bits_per_sample;
@@ -762,24 +870,22 @@ impl DecodeContext {
     }
 
     fn build_header_pack_into(
-        sdk:        &CrmSdkLibrary,
-        uuid:       &[u8],
-        craw:       &[u8],
+        sdk: &CrmSdkLibrary,
+        uuid: &[u8],
+        craw: &[u8],
         timed_meta: &[u8],
-        dst:        &mut Vec<u8>,
+        dst: &mut Vec<u8>,
     ) -> Result<()> {
-        let headers = [
-            Header { header_id: HeaderId::Uuid,          data: uuid.as_ptr()       as *mut _, size: uuid.len()       as u32 },
-            Header { header_id: HeaderId::Craw,          data: craw.as_ptr()       as *mut _, size: craw.len()       as u32 },
-            Header { header_id: HeaderId::TimedMetadata, data: timed_meta.as_ptr() as *mut _, size: timed_meta.len() as u32 },
-        ];
+        let headers = [Header::uuid(uuid), Header::craw(craw), Header::timed_metadata(timed_meta)];
         sdk.create_header_pack_into(&headers, dst)
     }
 }
 
 impl Drop for DecodeContext {
     fn drop(&mut self) {
-        let _ = self.sdk.release_process_ref(self.process_ref);
+        // SAFETY: `process_ref` was created in `new` and is released only
+        // here. No job can be pending: an async job's future borrows `self`.
+        let _ = unsafe { self.sdk.release_process_ref(self.process_ref) };
     }
 }
 
@@ -798,19 +904,29 @@ impl Drop for DecodeContext {
 /// `mem::forget`ing one is the single way to skip it. Nothing in this
 /// crate does.
 pub struct ResParamEdit<'a> {
-    ctx:    &'a mut DecodeContext,
+    ctx: &'a mut DecodeContext,
     before: ResParamV13,
+}
+
+impl std::fmt::Debug for ResParamEdit<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResParamEdit").field("before", &self.before).field("edited", &self.ctx.res_param).finish()
+    }
 }
 
 impl Deref for ResParamEdit<'_> {
     type Target = ResParamV13;
     #[inline]
-    fn deref(&self) -> &ResParamV13 { &self.ctx.res_param }
+    fn deref(&self) -> &ResParamV13 {
+        &self.ctx.res_param
+    }
 }
 
 impl DerefMut for ResParamEdit<'_> {
     #[inline]
-    fn deref_mut(&mut self) -> &mut ResParamV13 { &mut self.ctx.res_param }
+    fn deref_mut(&mut self) -> &mut ResParamV13 {
+        &mut self.ctx.res_param
+    }
 }
 
 impl Drop for ResParamEdit<'_> {

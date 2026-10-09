@@ -1,30 +1,33 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright © 2025 Adrian <adrian.eddy at gmail>
 
-#![allow(non_snake_case)]
-#![allow(non_camel_case_types)]
-#![allow(dead_code)]
 #![doc = include_str!("../README.md")]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
-use core::ffi::{c_char, c_float, c_int, c_short, c_schar, c_uchar, c_uint, c_ulonglong, c_ushort, c_void};
-use futures_util::task::AtomicWaker;
+use atomic_waker::AtomicWaker;
+use core::ffi::{c_char, c_float, c_int, c_schar, c_short, c_uchar, c_uint, c_ulonglong, c_ushort, c_void};
 use std::{
     ffi::CString,
     future::Future,
+    marker::PhantomData,
     path::Path,
     pin::Pin,
     sync::{
+        Arc, Condvar, Mutex, MutexGuard,
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
     },
     task::{Context, Poll},
 };
 
 pub mod crm_parser;
+pub mod cuda_exclusion;
 pub mod decode_context;
 pub mod error;
+pub mod image_info;
+pub use cuda_exclusion::{CudaExclusionGuard, cuda_exclusion};
 pub use decode_context::{DecodeContext, OutputGeometry};
 pub use error::*;
+pub use image_info::ImageInfo;
 
 // Crate-internal lifecycle test for the private `GetImageAsyncState`
 // co-ownership model (needs access to its private fields, so it cannot live in
@@ -32,16 +35,21 @@ pub use error::*;
 #[cfg(test)]
 mod get_image_async_tests;
 
-// Crate-internal gates for the private `Path` -> `CrmChar*` encoder (project
-// rule: tests never inline with the implementation). Hardware-free.
+// Crate-internal gates for the private `Path` -> `CrmChar*` encoder, kept in
+// their own file rather than inline with the implementation. Hardware-free.
 #[cfg(test)]
 #[path = "sdk_path_tests.rs"]
 mod sdk_path_tests;
 
-#[cfg(target_os = "windows")]
-use libloading::os::windows as dl;
+// Crate-internal gates for how values the SDK writes back are read: return
+// codes, format IDs, GPU info, text fields and image-info widths. Hardware-free.
+#[cfg(test)]
+mod ffi_value_tests;
+
 #[cfg(not(target_os = "windows"))]
 use libloading::os::unix as dl;
+#[cfg(target_os = "windows")]
+use libloading::os::windows as dl;
 
 /* -------------------------------------------------------------------------------------------------
  * Basic typedefs
@@ -67,13 +75,12 @@ pub type CrmFloat32 = c_float;
  * Enums
  * ------------------------------------------------------------------------------------------------- */
 
-
-pub const MAX_FILE_SIZE: u32            = 28318048;
-pub const RMF_4KDCI_FILE_SIZE: u32      = 1201840;
-pub const RMF_QFHD_FILE_SIZE: u32       = 1127497;
+pub const MAX_FILE_SIZE: u32 = 28318048;
+pub const RMF_4KDCI_FILE_SIZE: u32 = 1201840;
+pub const RMF_QFHD_FILE_SIZE: u32 = 1127497;
 pub const RMF_HALF_4KDCI_FILE_SIZE: u32 = 6047456;
-pub const RMF_HALF_QFHD_FILE_SIZE: u32  = 5675404;
-pub const SURFACE_NUM: u32              = 6;
+pub const RMF_HALF_QFHD_FILE_SIZE: u32 = 5675404;
+pub const SURFACE_NUM: u32 = 6;
 
 #[repr(u32)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -170,11 +177,42 @@ pub enum Gpu {
     Gpu8 = 0x0000_0080,
 }
 
-#[repr(u32)]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum FormatId {
-    MovieType1 = 0x0001_0001,
-    MovieType2 = 0x0001_0002,
+/// `CrmFormatId` — the format of a clip, as [`CrmSdkLibrary::get_format_id`]
+/// reports it.
+///
+/// A newtype over the raw value rather than an enum: the SDK hands this out,
+/// and it goes straight back in — to [`CrmSdkLibrary::create_process_ref`] and
+/// inside [`DevParamV13`] / [`ResParamV13`] — so every value the SDK can
+/// produce must be representable, including ones a newer SDK adds.
+#[repr(transparent)]
+#[derive(Copy, Clone, Eq, PartialEq, Hash)]
+pub struct FormatId(CrmUInt32);
+
+impl FormatId {
+    /// `kCrmFormatId_MovieType1`.
+    pub const MOVIE_TYPE_1: Self = Self(0x0001_0001);
+    /// `kCrmFormatId_MovieType2` — what the CRM clips of current cameras report.
+    pub const MOVIE_TYPE_2: Self = Self(0x0001_0002);
+
+    /// Wrap a raw `CrmFormatId` value.
+    pub const fn from_raw(raw: CrmUInt32) -> Self {
+        Self(raw)
+    }
+
+    /// The raw `CrmFormatId` value.
+    pub const fn raw(self) -> CrmUInt32 {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for FormatId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::MOVIE_TYPE_1 => f.write_str("FormatId::MOVIE_TYPE_1"),
+            Self::MOVIE_TYPE_2 => f.write_str("FormatId::MOVIE_TYPE_2"),
+            Self(raw) => write!(f, "FormatId({raw:#010x})"),
+        }
+    }
 }
 
 #[repr(u32)]
@@ -271,6 +309,37 @@ pub enum AcesIdt {
     Tng = 0x0000_0002,
 }
 
+/// What [`CrmSdkLibrary::get_aces_idt`] reports: the IDT the last develop
+/// applied.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct AcesIdtInfo {
+    /// The raw `CrmAcesIDT` value; [`idt`](Self::idt) decodes it.
+    pub raw: CrmUInt32,
+    /// The SDK's name for it, e.g. `"D55 Ver. 2.0"`.
+    pub name: String,
+}
+
+impl AcesIdtInfo {
+    /// The IDT, or `None` for a value `CrmSdkTypes.h` does not define.
+    pub fn idt(&self) -> Option<AcesIdt> {
+        AcesIdt::try_from(self.raw).ok()
+    }
+}
+
+impl TryFrom<CrmUInt32> for AcesIdt {
+    /// The raw value, when it is not one `CrmSdkTypes.h` defines.
+    type Error = CrmUInt32;
+
+    fn try_from(raw: CrmUInt32) -> std::result::Result<Self, CrmUInt32> {
+        match raw {
+            0 => Ok(Self::Auto),
+            1 => Ok(Self::D55),
+            2 => Ok(Self::Tng),
+            other => Err(other),
+        }
+    }
+}
+
 #[repr(u32)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum ColorSpace {
@@ -334,7 +403,7 @@ pub enum LensSqueeze {
 }
 
 bitflags::bitflags! {
-    #[repr(C)]
+    #[repr(transparent)]
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
     pub struct ProcessType: u32 {
         const DEVELOP                = 0x0000_0001;
@@ -362,6 +431,7 @@ pub enum DecodeLevel {
 
 #[repr(u32)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[allow(non_camel_case_types)] // `K4_5` / `K5_9` mirror the SDK's 4.5K / 5.9K names
 pub enum Resolution {
     K4 = 0x0000_0001,
     K4_5 = 0x0000_0002,
@@ -374,6 +444,19 @@ pub enum Resolution {
 pub enum ClSupportType {
     Full = 0x0000_0001,
     Limited = 0x0000_0002,
+}
+
+impl TryFrom<CrmUInt32> for ClSupportType {
+    /// The raw value, when it is not one `CrmSdkTypes.h` defines.
+    type Error = CrmUInt32;
+
+    fn try_from(raw: CrmUInt32) -> std::result::Result<Self, CrmUInt32> {
+        match raw {
+            1 => Ok(Self::Full),
+            2 => Ok(Self::Limited),
+            other => Err(other),
+        }
+    }
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -395,13 +478,13 @@ pub struct Rational16 {
 }
 
 #[repr(C)]
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct Umid32 {
     pub basic_umid: [CrmUInt8; 32],
 }
 
 #[repr(C)]
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct Umid64 {
     pub extended_umid: [CrmUInt8; 64],
 }
@@ -627,7 +710,7 @@ pub type MtlObjectRef = *mut MtlObject;
 pub struct CrmCudaInit {
     _devices: Box<[CrmUInt32]>,
     _streams: Box<[*mut CrmVoid]>,
-    raw:      CudaObject,
+    raw: CudaObject,
 }
 
 #[cfg(not(target_vendor = "apple"))]
@@ -645,15 +728,17 @@ impl CrmCudaInit {
     /// Panics on length mismatch; the FFI layout requires the two
     /// arrays to have the same `device_num` count.
     pub fn with_devices(devices: &[u32], streams: &[*mut core::ffi::c_void]) -> Self {
-        assert_eq!(devices.len(), streams.len(),
-            "CrmCudaInit::with_devices: devices and streams must have equal length");
-        let devices_box: Box<[CrmUInt32]> =
-            devices.iter().copied().collect::<Vec<_>>().into_boxed_slice();
-        let streams_box: Box<[*mut CrmVoid]> = streams.iter().map(|s| *s as *mut CrmVoid)
-            .collect::<Vec<_>>().into_boxed_slice();
+        assert_eq!(
+            devices.len(),
+            streams.len(),
+            "CrmCudaInit::with_devices: devices and streams must have equal length"
+        );
+        let devices_box: Box<[CrmUInt32]> = Box::from(devices);
+        let streams_box: Box<[*mut CrmVoid]> =
+            streams.iter().map(|s| *s as *mut CrmVoid).collect::<Vec<_>>().into_boxed_slice();
         let raw = CudaObject {
-            device_num:     devices_box.len() as CrmUInt32,
-            devices:        devices_box.as_ptr() as *mut CrmUInt32,
+            device_num: devices_box.len() as CrmUInt32,
+            devices: devices_box.as_ptr() as *mut CrmUInt32,
             compute_stream: streams_box.as_ptr() as *mut *mut CrmVoid,
         };
         Self { _devices: devices_box, _streams: streams_box, raw }
@@ -662,15 +747,15 @@ impl CrmCudaInit {
     /// Mutable access to the raw FFI struct. The SDK never mutates the
     /// pointer arrays, only the scalar `device_num` field — but the FFI
     /// signature requires `&mut`.
-    pub fn as_raw_mut(&mut self) -> &mut CudaObject { &mut self.raw }
+    pub fn as_raw_mut(&mut self) -> &mut CudaObject {
+        &mut self.raw
+    }
 }
 
 #[cfg(not(target_vendor = "apple"))]
 impl std::fmt::Debug for CrmCudaInit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CrmCudaInit")
-            .field("device_num", &self._devices.len())
-            .finish_non_exhaustive()
+        f.debug_struct("CrmCudaInit").field("device_num", &self._devices.len()).finish_non_exhaustive()
     }
 }
 
@@ -678,8 +763,8 @@ impl std::fmt::Debug for CrmCudaInit {
 /// [`CrmSdkLibrary::initialize_with_opencl`].
 pub struct CrmOpenClInit {
     _devices: Box<[*mut CrmVoid]>,
-    _queues:  Box<[*mut CrmVoid]>,
-    raw:      ClObject,
+    _queues: Box<[*mut CrmVoid]>,
+    raw: ClObject,
 }
 
 unsafe impl Send for CrmOpenClInit {}
@@ -687,9 +772,9 @@ unsafe impl Send for CrmOpenClInit {}
 impl CrmOpenClInit {
     /// Single-device shape.
     pub fn new(
-        platform_id:   *mut core::ffi::c_void,
-        device_id:     *mut core::ffi::c_void,
-        context:       *mut core::ffi::c_void,
+        platform_id: *mut core::ffi::c_void,
+        device_id: *mut core::ffi::c_void,
+        context: *mut core::ffi::c_void,
         command_queue: *mut core::ffi::c_void,
     ) -> Self {
         Self::with_devices(platform_id, context, &[device_id], &[command_queue])
@@ -697,35 +782,38 @@ impl CrmOpenClInit {
 
     /// Multi-device shape.
     pub fn with_devices(
-        platform_id:    *mut core::ffi::c_void,
-        context:        *mut core::ffi::c_void,
-        device_ids:     &[*mut core::ffi::c_void],
+        platform_id: *mut core::ffi::c_void,
+        context: *mut core::ffi::c_void,
+        device_ids: &[*mut core::ffi::c_void],
         command_queues: &[*mut core::ffi::c_void],
     ) -> Self {
-        assert_eq!(device_ids.len(), command_queues.len(),
-            "CrmOpenClInit::with_devices: device_ids and command_queues must have equal length");
-        let devices_box: Box<[*mut CrmVoid]> = device_ids.iter().map(|d| *d as *mut CrmVoid)
-            .collect::<Vec<_>>().into_boxed_slice();
-        let queues_box:  Box<[*mut CrmVoid]> = command_queues.iter().map(|q| *q as *mut CrmVoid)
-            .collect::<Vec<_>>().into_boxed_slice();
+        assert_eq!(
+            device_ids.len(),
+            command_queues.len(),
+            "CrmOpenClInit::with_devices: device_ids and command_queues must have equal length"
+        );
+        let devices_box: Box<[*mut CrmVoid]> =
+            device_ids.iter().map(|d| *d as *mut CrmVoid).collect::<Vec<_>>().into_boxed_slice();
+        let queues_box: Box<[*mut CrmVoid]> =
+            command_queues.iter().map(|q| *q as *mut CrmVoid).collect::<Vec<_>>().into_boxed_slice();
         let raw = ClObject {
-            platform_id:   platform_id as *mut CrmVoid,
-            device_ids:    devices_box.as_ptr() as *mut *mut CrmVoid,
-            device_num:    devices_box.len() as CrmUInt32,
-            context:       context as *mut CrmVoid,
+            platform_id: platform_id as *mut CrmVoid,
+            device_ids: devices_box.as_ptr() as *mut *mut CrmVoid,
+            device_num: devices_box.len() as CrmUInt32,
+            context: context as *mut CrmVoid,
             command_queue: queues_box.as_ptr() as *mut *mut CrmVoid,
         };
         Self { _devices: devices_box, _queues: queues_box, raw }
     }
 
-    pub fn as_raw_mut(&mut self) -> &mut ClObject { &mut self.raw }
+    pub fn as_raw_mut(&mut self) -> &mut ClObject {
+        &mut self.raw
+    }
 }
 
 impl std::fmt::Debug for CrmOpenClInit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CrmOpenClInit")
-            .field("device_num", &self._devices.len())
-            .finish_non_exhaustive()
+        f.debug_struct("CrmOpenClInit").field("device_num", &self._devices.len()).finish_non_exhaustive()
     }
 }
 
@@ -743,18 +831,20 @@ unsafe impl Send for CrmMetalInit {}
 impl CrmMetalInit {
     pub fn new(device: *mut core::ffi::c_void, command_queue: *mut core::ffi::c_void) -> Self {
         // `MtlObject::device_ids` is a single pointer (not a pointer
-        // array) per the SDK's `CrmSdkTypes.h:536-540`. Same for
+        // array) per the SDK's `CrmSdkTypes.h`. Same for
         // `command_queue` — both are scalar Objective-C handles.
         Self {
             raw: MtlObject {
-                device_ids:    device as *mut CrmVoid,
-                device_num:    1,
+                device_ids: device as *mut CrmVoid,
+                device_num: 1,
                 command_queue: command_queue as *mut CrmVoid,
             },
         }
     }
 
-    pub fn as_raw_mut(&mut self) -> &mut MtlObject { &mut self.raw }
+    pub fn as_raw_mut(&mut self) -> &mut MtlObject {
+        &mut self.raw
+    }
 }
 
 #[cfg(target_vendor = "apple")]
@@ -772,54 +862,187 @@ pub struct GpuSystemInfo {
     pub runtime_version: Version,
 }
 
+/// One GPU, as [`CrmSdkLibrary::get_gpu_info_list_with_device`] reports it.
+///
+/// Layout-compatible with the SDK's `CrmGpuInfo`, with every field held as the
+/// plain integer the SDK writes: `clSupportType` is a C enum the SDK leaves at
+/// `0` — a value [`ClSupportType`] does not have — for every CUDA device.
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct GpuInfo {
-    pub device_name: [CrmASCII; 256],
-    pub support: CrmBool,
-    pub compute_capability: Version,
-    pub cl_support_type: ClSupportType,
+    device_name: [CrmASCII; 256],
+    support: CrmBool,
+    compute_capability: Version,
+    cl_support_type: CrmUInt32,
 }
+
 impl GpuInfo {
+    /// All-zero, which is a valid value of every field.
+    const ZEROED: Self = Self {
+        device_name: [0; 256],
+        support: 0,
+        compute_capability: Version { major: 0, minor: 0 },
+        cl_support_type: 0,
+    };
+
+    /// The device name, e.g. `"NVIDIA GeForce RTX 5090"`.
     pub fn device_name(&self) -> String {
-        unsafe {
-            let c_str = std::ffi::CStr::from_ptr(self.device_name.as_ptr());
-            c_str.to_string_lossy().into_owned()
-        }
+        fixed_ascii(self.device_name.map(|c| c as u8).as_slice())
+    }
+
+    /// Whether the SDK can develop on this device.
+    pub fn is_supported(&self) -> bool {
+        self.support != 0
+    }
+
+    /// CUDA compute capability, or the OpenCL version, as the SDK reports it.
+    pub fn compute_capability(&self) -> Version {
+        self.compute_capability
+    }
+
+    /// How far OpenCL processing is supported. `None` for a device the field
+    /// does not apply to (the SDK reports `0` for CUDA devices) or a value
+    /// this crate does not know — see [`cl_support_type_raw`](Self::cl_support_type_raw).
+    pub fn cl_support_type(&self) -> Option<ClSupportType> {
+        ClSupportType::try_from(self.cl_support_type).ok()
+    }
+
+    /// The raw `clSupportType` value.
+    pub fn cl_support_type_raw(&self) -> CrmUInt32 {
+        self.cl_support_type
     }
 }
+
 impl std::fmt::Debug for GpuInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GpuInfo")
             .field("device_name", &self.device_name())
-            .field("support", &self.support)
+            .field("supported", &self.is_supported())
             .field("compute_capability", &self.compute_capability)
             .field("cl_support_type", &self.cl_support_type)
             .finish()
     }
 }
 
-// handles
-pub type ProcessRef = *mut CrmVoid;
+/// Decode a fixed-width SDK text field: up to the first NUL, or the whole field
+/// when the SDK fills it completely (it does — `CreationDateTime` is 24
+/// characters in a 24-byte field). Never reads past `bytes`.
+pub(crate) fn fixed_ascii(bytes: &[u8]) -> String {
+    let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..len]).into_owned()
+}
+
+/// The raw `CrmProcessRef` (`void*`) the C entry points take.
+pub type RawProcessRef = *mut CrmVoid;
+
+/// A process ref from [`CrmSdkLibrary::create_process_ref`]: the SDK's handle
+/// plus the device it was created for.
+///
+/// The device is what decides whether a call on the ref is CUDA processing,
+/// and so whether it runs under the [`cuda_exclusion()`] of spec § 9.2.1. A
+/// plain copyable handle — it does not release itself; [`DecodeContext`] is
+/// the owning wrapper.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ProcessRef {
+    raw: RawProcessRef,
+    device: Device,
+}
+
+// A handle value. Every use of it is an `unsafe` call whose contract covers
+// which thread may make it, so moving or sharing the value itself is sound.
+unsafe impl Send for ProcessRef {}
+unsafe impl Sync for ProcessRef {}
+
+impl ProcessRef {
+    /// Wrap a raw handle.
+    ///
+    /// # Safety
+    ///
+    /// `raw` must be a process ref the SDK created for `device`; a wrong
+    /// `device` makes calls skip, or take, the CUDA exclusion wrongly.
+    pub unsafe fn from_raw(raw: RawProcessRef, device: Device) -> Self {
+        Self { raw, device }
+    }
+
+    /// The raw `CrmProcessRef`.
+    pub fn as_raw(self) -> RawProcessRef {
+        self.raw
+    }
+
+    /// The device the ref was created for.
+    pub fn device(self) -> Device {
+        self.device
+    }
+}
+
 pub type DeviceHandle = *mut CrmVoid;
 pub type MemId = *mut CrmVoid;
 
+/// One chunk of a header pack, for [`CrmSdkLibrary::create_header_pack`]: a
+/// borrowed byte slice tagged with what it is.
+///
+/// Layout-compatible with the SDK's `CrmHeader`. It can only be built from a
+/// slice, so the pointer the SDK reads through always covers `size` live bytes
+/// for as long as the `Header` exists.
 #[repr(C)]
-#[derive(Default, Copy, Clone, Debug)]
-pub struct Header {
-    pub header_id: HeaderId,
-    pub data: *mut CrmVoid,
-    pub size: CrmUInt32,
+#[derive(Copy, Clone, Debug)]
+pub struct Header<'a> {
+    header_id: HeaderId,
+    data: *const CrmVoid,
+    size: CrmUInt32,
+    _data: PhantomData<&'a [u8]>,
+}
+
+impl<'a> Header<'a> {
+    /// A chunk of kind `header_id` over `data`.
+    ///
+    /// # Panics
+    ///
+    /// If `data` is longer than `u32::MAX` bytes, which no CRM header is.
+    pub fn new(header_id: HeaderId, data: &'a [u8]) -> Self {
+        let size = CrmUInt32::try_from(data.len()).expect("a CRM header chunk is far smaller than 4 GiB");
+        Self { header_id, data: data.as_ptr().cast(), size, _data: PhantomData }
+    }
+
+    /// The Canon `uuid` metadata box ([`CrmMovie::canon_metadata_box`](crm_parser::CrmMovie::canon_metadata_box)).
+    pub fn uuid(data: &'a [u8]) -> Self {
+        Self::new(HeaderId::Uuid, data)
+    }
+
+    /// The `CRAW` sample entry ([`CrmMovie::craw_entry`](crm_parser::CrmMovie::craw_entry)).
+    pub fn craw(data: &'a [u8]) -> Self {
+        Self::new(HeaderId::Craw, data)
+    }
+
+    /// One frame's timed metadata ([`CrmMovie::read_timed_meta`](crm_parser::CrmMovie::read_timed_meta)).
+    pub fn timed_metadata(data: &'a [u8]) -> Self {
+        Self::new(HeaderId::TimedMetadata, data)
+    }
+
+    /// What this chunk is.
+    pub fn header_id(&self) -> HeaderId {
+        self.header_id
+    }
+
+    /// The chunk's bytes.
+    pub fn data(&self) -> &'a [u8] {
+        // SAFETY: built from a `&'a [u8]` of exactly `size` bytes in `new`.
+        unsafe { std::slice::from_raw_parts(self.data.cast(), self.size as usize) }
+    }
 }
 
 /* -------------------------------------------------------------------------------------------------
  * Callback
  * ------------------------------------------------------------------------------------------------- */
 
-// No __stdcall specified in header typedef -> treat as C (cdecl) callback.
+// The header typedef carries no calling-convention annotation. `extern "system"`
+// is the C convention on every target the SDK ships for (x86_64 Windows,
+// Linux, macOS).
+/// `CRM_GetImageCallback`. `in_error` and the return value are raw
+/// [`CrmErrorCode`]s, for the same reason every entry point returns one.
 pub type GetImageCallback = Option<
     unsafe extern "system" fn(
-        in_process_ref: ProcessRef,
+        in_process_ref: RawProcessRef,
         in_dst_buffer: *mut CrmVoid,
         in_dst_buffer_size: CrmUInt32,
         in_dst_data_size: CrmUInt32,
@@ -834,10 +1057,13 @@ pub type GetImageCallback = Option<
         in_ref_con: *mut CrmVoid,
         in_header_buffer: *mut CrmVoid,
         in_header_data_size: CrmUInt32,
-        in_error: SdkError,
-    ) -> SdkError,
+        in_error: CrmErrorCode,
+    ) -> CrmErrorCode,
 >;
 
+/// The `outDstDataSize` cell of a [`CrmSdkLibrary::get_image_async_raw`] job.
+/// The SDK may write it until the job's callback fires, so keep the token
+/// alive until then, and read it only afterwards.
 #[derive(Debug)]
 pub struct GetImageAsyncToken {
     dst_data_size: Box<CrmUInt32>,
@@ -854,19 +1080,31 @@ pub struct GetImageAsyncOutput {
     pub dst_data_size: CrmUInt32,
 }
 
+/// Completion state of one `CrmGetImageAsync` job, shared by its future and
+/// the SDK: the future holds one `Arc`, and the SDK holds another, handed over
+/// through `inRefCon` with `Arc::into_raw` and reclaimed in the callback.
 #[derive(Debug)]
 struct GetImageAsyncState {
     waker: AtomicWaker,
     done: AtomicBool,
     result: Mutex<Option<GetImageAsyncCallbackResult>>,
+    /// Signalled, with `result` locked, once the callback has run.
+    completed: Condvar,
 }
 
 #[derive(Debug, Copy, Clone)]
 struct GetImageAsyncCallbackResult {
     dst_buffer: *mut CrmVoid,
     dst_data_size: CrmUInt32,
-    error: SdkError,
+    error: CrmErrorCode,
 }
+
+// The callback fires on an SDK worker thread and hands this result to the
+// polling thread through `GetImageAsyncState`. `dst_buffer` is the caller's own
+// destination pointer echoed back by the SDK; this crate never dereferences it,
+// so moving the value between threads is sound. This is what makes
+// `GetImageAsyncState` `Send + Sync`, which the cross-thread `Arc` requires.
+unsafe impl Send for GetImageAsyncCallbackResult {}
 
 impl GetImageAsyncState {
     fn new() -> Self {
@@ -874,21 +1112,38 @@ impl GetImageAsyncState {
             waker: AtomicWaker::new(),
             done: AtomicBool::new(false),
             result: Mutex::new(None),
+            completed: Condvar::new(),
         }
     }
 
+    fn lock_result(&self) -> MutexGuard<'_, Option<GetImageAsyncCallbackResult>> {
+        // Nothing that holds this lock can panic, but a poisoned slot is
+        // still a valid one.
+        self.result.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn complete(&self, result: GetImageAsyncCallbackResult) {
-        {
-            let mut lock = self.result.lock().unwrap();
-            *lock = Some(result);
-        }
+        let mut slot = self.lock_result();
+        *slot = Some(result);
         self.done.store(true, Ordering::Release);
+        self.completed.notify_all();
+        drop(slot);
         self.waker.wake();
+    }
+
+    /// Block until the SDK's completion callback has run. The SDK calls it
+    /// once it has finished with the job, so afterwards nothing the job was
+    /// given — inputs, destination, `outDstDataSize` — is touched again.
+    fn wait(&self) {
+        let mut slot = self.lock_result();
+        while !self.done.load(Ordering::Acquire) {
+            slot = self.completed.wait(slot).unwrap_or_else(|e| e.into_inner());
+        }
     }
 }
 
 unsafe extern "system" fn get_image_async_callback(
-    _in_process_ref: ProcessRef,
+    _in_process_ref: RawProcessRef,
     in_dst_buffer: *mut CrmVoid,
     _in_dst_buffer_size: CrmUInt32,
     in_dst_data_size: CrmUInt32,
@@ -903,12 +1158,14 @@ unsafe extern "system" fn get_image_async_callback(
     in_ref_con: *mut CrmVoid,
     _in_header_buffer: *mut CrmVoid,
     _in_header_data_size: CrmUInt32,
-    in_error: SdkError,
-) -> SdkError {
+    in_error: CrmErrorCode,
+) -> CrmErrorCode {
     if in_ref_con.is_null() {
         return in_error;
     }
 
+    // SAFETY: `in_ref_con` is the `Arc::into_raw` that `submit_get_image_async`
+    // gave this one job, and the SDK calls back exactly once per job.
     let state = unsafe { Arc::from_raw(in_ref_con as *const GetImageAsyncState) };
     state.complete(GetImageAsyncCallbackResult {
         dst_buffer: in_dst_buffer,
@@ -916,53 +1173,61 @@ unsafe extern "system" fn get_image_async_callback(
         error: in_error,
     });
 
-    SdkError::Ok
+    CRM_ERR_OK
 }
 
 /// Shared `poll` body for [`GetImageFuture`] / [`OwnedGetImageFuture`]:
 /// register the waker, and on completion translate the SDK result into
-/// `Poll::Ready`. The two futures differ only in how they hold the SDK
-/// handle (`&` vs `Arc`); the completion logic is identical.
-fn poll_get_image(
-    sdk:   &CrmSdkLibrary,
-    state: &GetImageAsyncState,
-    cx:    &mut Context<'_>,
-) -> Poll<Result<GetImageAsyncOutput>> {
+/// `Poll::Ready`.
+fn poll_get_image(state: &GetImageAsyncState, cx: &mut Context<'_>) -> Poll<Result<GetImageAsyncOutput>> {
     state.waker.register(cx.waker());
-    if state.done.load(Ordering::Acquire) {
-        if let Some(res) = state.result.lock().unwrap().take() {
-            if let Err(e) = sdk.err_to_result(res.error) {
-                return Poll::Ready(Err(e));
-            }
-            return Poll::Ready(Ok(GetImageAsyncOutput {
-                dst_buffer:    res.dst_buffer,
-                dst_data_size: res.dst_data_size,
-            }));
-        }
+    if !state.done.load(Ordering::Acquire) {
+        return Poll::Pending;
     }
-    Poll::Pending
+    match state.lock_result().take() {
+        Some(res) => Poll::Ready(
+            sdk_result(res.error)
+                .map(|()| GetImageAsyncOutput { dst_buffer: res.dst_buffer, dst_data_size: res.dst_data_size }),
+        ),
+        None => Poll::Pending,
+    }
 }
 
+/// One `CrmGetImageAsync` job, borrowing its inputs
+/// ([`CrmSdkLibrary::get_image_future`]). Resolves when the SDK's completion
+/// callback fires.
+///
+/// Dropping it while the job is still running **blocks** until the SDK
+/// finishes: the job reads the borrowed inputs, and writes the destination,
+/// until then.
 pub struct GetImageFuture<'a> {
-    sdk: &'a CrmSdkLibrary,
     state: Arc<GetImageAsyncState>,
     _out_dst_data_size: Box<CrmUInt32>,
-    _in_src_buffer: &'a [u8],
-    _in_dev_param: &'a DevParamV13,
-    _in_res_param: &'a ResParamV13,
-    _in_header_buffer: &'a [u8],
+    _inputs: PhantomData<(&'a CrmSdkLibrary, &'a [u8], &'a DevParamV13, &'a ResParamV13)>,
+}
+
+impl std::fmt::Debug for GetImageFuture<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GetImageFuture").field("done", &self.state.done.load(Ordering::Acquire)).finish_non_exhaustive()
+    }
 }
 
 impl Future for GetImageFuture<'_> {
     type Output = Result<GetImageAsyncOutput>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        poll_get_image(this.sdk, &this.state, cx)
+        poll_get_image(&self.state, cx)
     }
 }
 
-/// `'static` owned-source variant of [`GetImageFuture`].
+impl Drop for GetImageFuture<'_> {
+    fn drop(&mut self) {
+        self.state.wait();
+    }
+}
+
+/// `'static` owned-source variant of [`GetImageFuture`]
+/// ([`CrmSdkLibrary::get_image_future_owned`]).
 ///
 /// The borrowed [`GetImageFuture`] pins `&'a` references to the source /
 /// header / dev / res inputs, so it cannot be parked in a `Vec` alongside
@@ -971,33 +1236,40 @@ impl Future for GetImageFuture<'_> {
 /// This variant instead **owns** the dev/res param structs (which the SDK
 /// reads via raw pointer until the callback fires) plus opaque `Send`
 /// keepalives backing the source + header pointers. The output buffer is the
-/// caller's (kept alive by the caller's pipeline ticket). `Unpin`.
+/// caller's. `Unpin`.
 ///
-/// Completion is driven by the same `Arc::into_raw`/`from_raw`-co-owned
-/// [`GetImageAsyncState`] + waker as [`GetImageFuture`], so dropping a pending
-/// future is memory-safe (the SDK still owns a `State` refcount).
+/// Dropping it while the job is still running **blocks** until the SDK
+/// finishes, so the keepalives — and anything the caller drops after the
+/// future, such as the destination — outlive the job.
 pub struct OwnedGetImageFuture {
-    sdk:                Arc<CrmSdkLibrary>,
-    state:              Arc<GetImageAsyncState>,
+    state: Arc<GetImageAsyncState>,
+    _sdk: Arc<CrmSdkLibrary>,
     _out_dst_data_size: Box<CrmUInt32>,
-    _dev_param:         Box<DevParamV13>,
-    _res_param:         Box<ResParamV13>,
-    _src_keep:          Box<dyn core::any::Any + Send>,
-    _hdr_keep:          Box<dyn core::any::Any + Send>,
+    _dev_param: Box<DevParamV13>,
+    _res_param: Box<ResParamV13>,
+    _src_keep: Box<dyn core::any::Any + Send>,
+    _hdr_keep: Box<dyn core::any::Any + Send>,
 }
 
-// OwnedGetImageFuture — Send only. Its only non-auto-`Send` members are
-// the `Arc`-wrapped SDK handle and the opaque `Send`-bounded keepalives;
-// the future holds no raw output pointer (the caller's ticket owns that).
-// Single-owner per decoder, matching the `CrmSdkLibrary` Send contract.
-unsafe impl Send for OwnedGetImageFuture {}
+impl std::fmt::Debug for OwnedGetImageFuture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnedGetImageFuture")
+            .field("done", &self.state.done.load(Ordering::Acquire))
+            .finish_non_exhaustive()
+    }
+}
 
 impl Future for OwnedGetImageFuture {
     type Output = Result<GetImageAsyncOutput>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        poll_get_image(&this.sdk, &this.state, cx)
+        poll_get_image(&self.state, cx)
+    }
+}
+
+impl Drop for OwnedGetImageFuture {
+    fn drop(&mut self) {
+        self.state.wait();
     }
 }
 
@@ -1005,49 +1277,55 @@ impl Future for OwnedGetImageFuture {
  * Exported function pointer types (libloading-friendly)
  * ------------------------------------------------------------------------------------------------- */
 
-pub type CrmInitializeSDKFn = unsafe extern "system" fn() -> SdkError;
-pub type CrmInitializeSDKWithOpenCLFn = unsafe extern "system" fn(cl_object: ClObjectRef) -> SdkError;
+pub type CrmInitializeSDKFn = unsafe extern "system" fn() -> CrmErrorCode;
+pub type CrmInitializeSDKWithOpenCLFn = unsafe extern "system" fn(cl_object: ClObjectRef) -> CrmErrorCode;
 /// `in_use_device` is the C enum `CrmDevice` — the SDK accepts bitwise-
-/// OR'd values like `kCrmDeviceCpu | kCrmDeviceCuda` per
-/// `TestCrmSdk.cpp:1320`, so the Rust binding takes a raw `CrmUInt32`
-/// to allow the OR-mask shape. The typed `initialize_with_*` wrappers
-/// build the right mask.
-pub type CrmInitializeSDKWithDeviceFn = unsafe extern "system" fn(in_use_device: CrmUInt32, in_gpu_param: *mut CrmVoid) -> SdkError;
-pub type CrmTerminateSDKFn = unsafe extern "system" fn() -> SdkError;
+/// OR'd values like `kCrmDeviceCpu | kCrmDeviceCuda` (Canon's sample code,
+/// `TestCrmSdk.cpp`, builds every mask that way), so the Rust binding takes a
+/// raw `CrmUInt32` to allow the OR-mask shape. The typed `initialize_with_*`
+/// wrappers build the right mask.
+pub type CrmInitializeSDKWithDeviceFn =
+    unsafe extern "system" fn(in_use_device: CrmUInt32, in_gpu_param: *mut CrmVoid) -> CrmErrorCode;
+pub type CrmTerminateSDKFn = unsafe extern "system" fn() -> CrmErrorCode;
 
 pub type CrmGetFormatIdFn = unsafe extern "system" fn(
     in_buffer: *mut CrmVoid,
     in_data_size: CrmUInt32,
-    out_format_id: *mut FormatId,
-) -> SdkError;
+    out_format_id: *mut CrmUInt32,
+) -> CrmErrorCode;
 
 pub type CrmCreateProcessRefFn = unsafe extern "system" fn(
-    out_process_ref: *mut ProcessRef,
+    out_process_ref: *mut RawProcessRef,
     in_format_id: FormatId,
     in_use_device: Device,
     in_use_gpu: Gpu,
     in_process_type: ProcessType,
     in_max_resolution: Resolution,
-) -> SdkError;
+) -> CrmErrorCode;
 
-pub type CrmResetProcessRefFn = unsafe extern "system" fn(in_process_ref: ProcessRef) -> SdkError;
-pub type CrmReleaseProcessRefFn = unsafe extern "system" fn(in_process_ref: ProcessRef) -> SdkError;
+pub type CrmResetProcessRefFn = unsafe extern "system" fn(in_process_ref: RawProcessRef) -> CrmErrorCode;
+pub type CrmReleaseProcessRefFn = unsafe extern "system" fn(in_process_ref: RawProcessRef) -> CrmErrorCode;
 
-pub type CrmAllocateFn = unsafe extern "system" fn(out_buffer: *mut *mut CrmVoid, in_buffer_size: CrmUInt32, in_use_device: Device) -> SdkError;
-pub type CrmDeallocateFn = unsafe extern "system" fn(in_buffer: *mut CrmVoid, in_use_device: Device) -> SdkError;
+pub type CrmAllocateFn = unsafe extern "system" fn(
+    out_buffer: *mut *mut CrmVoid,
+    in_buffer_size: CrmUInt32,
+    in_use_device: Device,
+) -> CrmErrorCode;
+pub type CrmDeallocateFn = unsafe extern "system" fn(in_buffer: *mut CrmVoid, in_use_device: Device) -> CrmErrorCode;
 
 pub type CrmDeviceAllocateFn = unsafe extern "system" fn(
-    in_process_ref: ProcessRef,
+    in_process_ref: RawProcessRef,
     out_buffer: *mut *mut CrmVoid,
     in_buffer_size: CrmUInt32,
     in_buffer_type: BufferType,
     in_use_gpu: Gpu,
-) -> SdkError;
+) -> CrmErrorCode;
 
-pub type CrmDeviceDeallocateFn = unsafe extern "system" fn(in_process_ref: ProcessRef, in_buffer: *mut CrmVoid) -> SdkError;
+pub type CrmDeviceDeallocateFn =
+    unsafe extern "system" fn(in_process_ref: RawProcessRef, in_buffer: *mut CrmVoid) -> CrmErrorCode;
 
 pub type CrmGetImageFn = unsafe extern "system" fn(
-    in_process_ref: ProcessRef,
+    in_process_ref: RawProcessRef,
     out_dst_buffer: *mut CrmVoid,
     in_dst_buffer_size: CrmUInt32,
     out_dst_data_size: *mut CrmUInt32,
@@ -1061,10 +1339,10 @@ pub type CrmGetImageFn = unsafe extern "system" fn(
     in_res_param: *mut CrmVoid,
     in_header_buffer: *mut CrmVoid,
     in_header_data_size: CrmUInt32,
-) -> SdkError;
+) -> CrmErrorCode;
 
 pub type CrmGetImageAsyncFn = unsafe extern "system" fn(
-    in_process_ref: ProcessRef,
+    in_process_ref: RawProcessRef,
     out_dst_buffer: *mut CrmVoid,
     in_dst_buffer_size: CrmUInt32,
     out_dst_data_size: *mut CrmUInt32,
@@ -1080,10 +1358,10 @@ pub type CrmGetImageAsyncFn = unsafe extern "system" fn(
     in_header_buffer: *mut CrmVoid,
     in_header_data_size: CrmUInt32,
     in_func: GetImageCallback,
-) -> SdkError;
+) -> CrmErrorCode;
 
 pub type CrmEnqueueImageFn = unsafe extern "system" fn(
-    in_process_ref: ProcessRef,
+    in_process_ref: RawProcessRef,
     in_bits_per_sample: CrmUInt32,
     in_samples_per_pixel: CrmUInt32,
     in_bytes_per_line: CrmUInt32,
@@ -1095,44 +1373,46 @@ pub type CrmEnqueueImageFn = unsafe extern "system" fn(
     in_ref_con: *mut CrmVoid,
     in_header_buffer: *mut CrmVoid,
     in_header_data_size: CrmUInt32,
-) -> SdkError;
+) -> CrmErrorCode;
 
 pub type CrmDequeueImageFn = unsafe extern "system" fn(
-    in_process_ref: ProcessRef,
+    in_process_ref: RawProcessRef,
     out_dst_buffer: *mut CrmVoid,
     in_dst_buffer_size: CrmUInt32,
     out_dst_data_size: *mut CrmUInt32,
     out_ref_con: *mut *mut CrmVoid,
-) -> SdkError;
+) -> CrmErrorCode;
 
 pub type CrmGetImageInfoFn = unsafe extern "system" fn(
     in_format_id: CrmUInt32,
     in_buffer: *mut CrmVoid,
     in_data_size: CrmUInt32,
-    in_image_info_id: ImageInfoId,
+    in_image_info_id: CrmUInt32,
     out_image_info: *mut CrmVoid,
-) -> SdkError;
+) -> CrmErrorCode;
 
 pub type CrmGetGpuSystemInfoFn = unsafe extern "system" fn(
     out_cuda_gpu_system_info: *mut GpuSystemInfo,
     out_cl_gpu_system_info: *mut GpuSystemInfo,
-) -> SdkError;
+) -> CrmErrorCode;
 
-pub type CrmGetGpuInfoListFn = unsafe extern "system" fn(out_cuda_gpu_info: *mut GpuInfo, out_cl_gpu_info: *mut GpuInfo) -> SdkError;
+pub type CrmGetGpuInfoListFn =
+    unsafe extern "system" fn(out_cuda_gpu_info: *mut GpuInfo, out_cl_gpu_info: *mut GpuInfo) -> CrmErrorCode;
 
 pub type CrmGetSdkInfoFn = unsafe extern "system" fn(
     out_sdk_version: *mut Version,
     out_pipeline_num: *mut CrmUInt32,
     out_usable_gpu_num: *mut CrmUInt32,
-) -> SdkError;
+) -> CrmErrorCode;
 
-pub type CrmGetWbGainFn = unsafe extern "system" fn(in_process_ref: ProcessRef, out_wb_gain: *mut WbGain) -> SdkError;
+pub type CrmGetWbGainFn =
+    unsafe extern "system" fn(in_process_ref: RawProcessRef, out_wb_gain: *mut WbGain) -> CrmErrorCode;
 
 pub type CrmGetAcesIdtFn = unsafe extern "system" fn(
-    in_process_ref: ProcessRef,
-    out_aces_idt: *mut AcesIdt,
+    in_process_ref: RawProcessRef,
+    out_aces_idt: *mut CrmUInt32,
     out_aces_idt_str: *mut CrmASCII,
-) -> SdkError;
+) -> CrmErrorCode;
 
 pub type CrmGetSdkInfoWithDeviceFn = unsafe extern "system" fn(
     out_sdk_version: *mut Version,
@@ -1140,39 +1420,44 @@ pub type CrmGetSdkInfoWithDeviceFn = unsafe extern "system" fn(
     out_usable_gpu_num: *mut CrmUInt32,
     in_use_device: Device,
     in_process_type: ProcessType,
-) -> SdkError;
+) -> CrmErrorCode;
 
-pub type CrmGetGpuSystemInfoWithDeviceFn = unsafe extern "system" fn(out_gpu_system_info: *mut GpuSystemInfo, in_use_device: Device) -> SdkError;
-pub type CrmGetGpuInfoListWithDeviceFn = unsafe extern "system" fn(out_gpu_info: *mut GpuInfo, in_use_device: Device) -> SdkError;
+pub type CrmGetGpuSystemInfoWithDeviceFn =
+    unsafe extern "system" fn(out_gpu_system_info: *mut GpuSystemInfo, in_use_device: Device) -> CrmErrorCode;
+pub type CrmGetGpuInfoListWithDeviceFn =
+    unsafe extern "system" fn(out_gpu_info: *mut GpuInfo, in_use_device: Device) -> CrmErrorCode;
 
 #[cfg(target_os = "windows")]
 pub type CrmSetDeviceHandleForIntelFn = unsafe extern "system" fn(
-    in_process_ref: ProcessRef,
+    in_process_ref: RawProcessRef,
     in_device_handle: DeviceHandle,
     in_mem_type: MemType,
-) -> SdkError;
+) -> CrmErrorCode;
 
 #[cfg(target_os = "windows")]
-pub type CrmSetImageParamForIntelFn = unsafe extern "system" fn(in_process_ref: ProcessRef, in_resolution: Size, in_crop: Rect) -> SdkError;
+pub type CrmSetImageParamForIntelFn =
+    unsafe extern "system" fn(in_process_ref: RawProcessRef, in_resolution: Size, in_crop: Rect) -> CrmErrorCode;
 
 #[cfg(target_os = "windows")]
-pub type CrmAllocateD3dSurfacesForIntelFn = unsafe extern "system" fn(in_process_ref: ProcessRef, out_mem_id_array: *mut MemId) -> SdkError;
+pub type CrmAllocateD3dSurfacesForIntelFn =
+    unsafe extern "system" fn(in_process_ref: RawProcessRef, out_mem_id_array: *mut MemId) -> CrmErrorCode;
 
 #[cfg(target_os = "windows")]
-pub type CrmDeallocateD3dSurfacesForIntelFn = unsafe extern "system" fn(in_process_ref: ProcessRef, in_mem_id_array: MemId) -> SdkError;
+pub type CrmDeallocateD3dSurfacesForIntelFn =
+    unsafe extern "system" fn(in_process_ref: RawProcessRef, in_mem_id_array: MemId) -> CrmErrorCode;
 
 #[cfg(target_os = "windows")]
 pub type CrmCreateDeviceHandleForIntelFn = unsafe extern "system" fn(
-    in_process_ref: ProcessRef,
+    in_process_ref: RawProcessRef,
     out_device_handle: *mut DeviceHandle,
     in_mem_type: MemType,
-) -> SdkError;
+) -> CrmErrorCode;
 
 #[cfg(target_os = "windows")]
-pub type CrmCleanupDeviceHandleForIntelFn = unsafe extern "system" fn(in_process_ref: ProcessRef) -> SdkError;
+pub type CrmCleanupDeviceHandleForIntelFn = unsafe extern "system" fn(in_process_ref: RawProcessRef) -> CrmErrorCode;
 
 pub type CrmPreProcessForGetImageWithGpuMemoryFn = unsafe extern "system" fn(
-    in_process_ref: ProcessRef,
+    in_process_ref: RawProcessRef,
     in_bits_per_sample: CrmUInt32,
     in_samples_per_pixel: CrmUInt32,
     in_bytes_per_line: CrmUInt32,
@@ -1182,18 +1467,19 @@ pub type CrmPreProcessForGetImageWithGpuMemoryFn = unsafe extern "system" fn(
     in_dev_param: *mut CrmVoid,
     in_res_param: *mut CrmVoid,
     out_required_buffer_size: *mut CrmUInt32,
-) -> SdkError;
+) -> CrmErrorCode;
 
 pub type CrmGetImageWithGpuMemoryFn = unsafe extern "system" fn(
-    in_process_ref: ProcessRef,
+    in_process_ref: RawProcessRef,
     out_dst_buffer: *mut CrmVoid,
     in_dst_buffer_size: CrmUInt32,
     out_dst_data_size: *mut CrmUInt32,
     in_src_buffer: *mut CrmVoid,
     in_src_data_size: CrmUInt32,
-) -> SdkError;
+) -> CrmErrorCode;
 
-pub type CrmGetLastErrorFn = unsafe extern "system" fn(out_error_msg: *mut CrmChar, in_buffer_size: CrmUInt32) -> SdkError;
+pub type CrmGetLastErrorFn =
+    unsafe extern "system" fn(out_error_msg: *mut CrmChar, in_buffer_size: CrmUInt32) -> CrmErrorCode;
 
 pub type CrmGetOutImageSizeFn = unsafe extern "system" fn(
     in_res_param: *mut CrmVoid,
@@ -1201,22 +1487,57 @@ pub type CrmGetOutImageSizeFn = unsafe extern "system" fn(
     out_image_height: *mut CrmUInt32,
     in_header_buffer: *mut CrmVoid,
     in_header_size: CrmUInt32,
-) -> SdkError;
+) -> CrmErrorCode;
 
 pub type CrmCreateHeaderPackFn = unsafe extern "system" fn(
-    in_header_array: *mut Header,
+    in_header_array: *const Header<'_>,
     in_header_num: CrmUInt32,
     out_dst_buffer: *mut CrmVoid,
     in_dst_buffer_size: CrmUInt32,
     out_dst_data_size: *mut CrmUInt32,
-) -> SdkError;
+) -> CrmErrorCode;
 
-pub type CrmSetLutsDirectoryFn = unsafe extern "system" fn(in_directory_path: *const CrmChar, in_is_absolute_path: CrmBool) -> SdkError;
+pub type CrmSetLutsDirectoryFn =
+    unsafe extern "system" fn(in_directory_path: *const CrmChar, in_is_absolute_path: CrmBool) -> CrmErrorCode;
 
 /* -------------------------------------------------------------------------------------------------
  * libloading wrapper
  * ------------------------------------------------------------------------------------------------- */
 
+/// A loaded `CrmSdk` library with every entry point resolved.
+///
+/// Construct with [`load`](Self::load). The `pub` fields are the raw resolved
+/// symbols, for anything the methods below do not cover.
+///
+/// # What is `unsafe`, and why
+///
+/// The methods are thin wrappers over the C entry points, and the SDK checks
+/// none of what it is handed. So every method that passes the SDK a raw
+/// pointer, a [`ProcessRef`], or GPU handles it will use later is an
+/// `unsafe fn`, with a `# Safety` section stating what the SDK needs; the
+/// methods that take only slices and values are safe. [`DecodeContext`] and
+/// [`CrmMemory`] are the safe owning layer over the unsafe surface.
+///
+/// In the other direction, every value the SDK writes back is read as the
+/// plain integer it is — return codes, format IDs, `clSupportType`, ACES
+/// IDTs, image-info properties — and only then converted, so no SDK build can
+/// hand Rust an invalid enum.
+///
+/// # Threads
+///
+/// Spec § 9.2.1 requires that, with CUDA processing, `CrmCreateProcessRef`,
+/// `CrmGetImage`, `CrmEnqueueImage`, `CrmDequeueImage` and
+/// `CrmReleaseProcessRef` never run at the same time as one another or as the
+/// application's own CUDA API calls. Those five methods take the process-wide
+/// [`cuda_exclusion()`] whenever their [`ProcessRef`] is a
+/// [`Device::Cuda`] one, so concurrent decoders stay within the contract by
+/// construction; [`cuda_exclusion()`] is also how the application brings its own
+/// CUDA calls under it.
+///
+/// Everything else runs concurrently: CPU, OpenCL and Metal refs (§ 9.2.2 and
+/// § 9.2.3 allow multi-threaded use), and `CrmGetImageAsync`, which is not on
+/// the § 9.2.1 list. A pipeline that decompresses asynchronously on a CPU ref
+/// and develops on a CUDA one keeps its decompress parallel.
 #[allow(non_snake_case)]
 pub struct CrmSdkLibrary {
     pub CrmInitializeSDK: dl::Symbol<CrmInitializeSDKFn>,
@@ -1287,17 +1608,25 @@ pub struct CrmSdkLibrary {
     pub CrmCreateHeaderPack: dl::Symbol<CrmCreateHeaderPackFn>,
     pub CrmSetLUTsDirectory: dl::Symbol<CrmSetLutsDirectoryFn>,
 
-    // must be last
-    lib: dl::Library,
+    // Must be last: fields drop in declaration order, so the library stays
+    // mapped until every resolved symbol above is gone.
+    _lib: dl::Library,
 }
 
 // CrmSdkLibrary — Send + Sync. Holds a refcounted `libloading::Library`
 // handle plus resolved (stateless) function pointers; no apartment-model
-// thread affinity. Concurrent `&self` access hits SDK functions the
-// vendor documents as thread-safe for the init/allocate/decode/release
-// surface.
+// thread affinity. The SDK's one threading restriction (spec § 9.2.1, CUDA)
+// is enforced by the methods themselves; see "Threads" above.
 unsafe impl Send for CrmSdkLibrary {}
 unsafe impl Sync for CrmSdkLibrary {}
+
+impl std::fmt::Debug for CrmSdkLibrary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CrmSdkLibrary")
+            .field("has_get_image_async", &self.CrmGetImageAsync.is_some())
+            .finish_non_exhaustive()
+    }
+}
 
 /// Encode a filesystem path the way `CrmSdk` decodes it.
 ///
@@ -1323,19 +1652,41 @@ fn sdk_path_cstring(path: &Path) -> Result<CString> {
             // SAFETY: `wide` is a valid `[u16]` of `wide.len()`; a null
             // destination with size 0 is the documented length query.
             let len = unsafe {
-                WideCharToMultiByte(CP_THREAD_ACP, WC_NO_BEST_FIT_CHARS, wide.as_ptr(), wide.len() as i32, std::ptr::null_mut(), 0, std::ptr::null(), std::ptr::null_mut())
+                WideCharToMultiByte(
+                    CP_THREAD_ACP,
+                    WC_NO_BEST_FIT_CHARS,
+                    wide.as_ptr(),
+                    wide.len() as i32,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                )
             };
             if len <= 0 {
-                return Err(CrmError::InvalidParameter("path is not representable in the ANSI code page the SDK decodes with"));
+                return Err(CrmError::InvalidParameter(
+                    "path is not representable in the ANSI code page the SDK decodes with",
+                ));
             }
             let mut buf = vec![0u8; len as usize];
             let mut used_default: CrmBool = 0;
             // SAFETY: `buf` has exactly the `len` bytes the query asked for.
             let written = unsafe {
-                WideCharToMultiByte(CP_THREAD_ACP, WC_NO_BEST_FIT_CHARS, wide.as_ptr(), wide.len() as i32, buf.as_mut_ptr(), len, std::ptr::null(), &mut used_default)
+                WideCharToMultiByte(
+                    CP_THREAD_ACP,
+                    WC_NO_BEST_FIT_CHARS,
+                    wide.as_ptr(),
+                    wide.len() as i32,
+                    buf.as_mut_ptr(),
+                    len,
+                    std::ptr::null(),
+                    &mut used_default,
+                )
             };
             if written != len || used_default != 0 {
-                return Err(CrmError::InvalidParameter("path is not representable in the ANSI code page the SDK decodes with"));
+                return Err(CrmError::InvalidParameter(
+                    "path is not representable in the ANSI code page the SDK decodes with",
+                ));
             }
             buf
         }
@@ -1349,8 +1700,43 @@ fn sdk_path_cstring(path: &Path) -> Result<CString> {
     CString::new(bytes).map_err(|_| CrmError::InvalidParameter("path contains an interior NUL byte"))
 }
 
+/// Turn a raw [`CrmErrorCode`] into a `Result`.
+///
+/// Error strings are not fetched here: `get_last_error_string` allocates 8 KiB
+/// per call, and `DevelopEmptyQueue` / `WaitTimeoutError` are ordinary flow
+/// control on the queue path. Callers that want the SDK's detail string call
+/// [`CrmSdkLibrary::get_last_error_string`] themselves.
+fn sdk_result(code: CrmErrorCode) -> Result<()> {
+    match SdkError::from_code(code) {
+        None => Ok(()),
+        Some(e) => Err(CrmError::SdkError(e)),
+    }
+}
+
+/// The scratch buffer every [`CrmSdkLibrary::get_image_info`] call hands the
+/// SDK. `CrmGetImageInfo` takes no output size, and writes as many bytes as
+/// the property is wide — 80 at most in CRMSDK 2.10 (`LensName`), measured
+/// against the real library. 512 zeroed bytes leave room for a wider property
+/// from a newer SDK, and the zeroing gives a defined value when the SDK
+/// returns `CRM_ERR_OK` without writing anything (it does, for an ID it does
+/// not know).
+const IMAGE_INFO_SCRATCH: usize = 512;
+
+#[repr(C, align(8))]
+struct ImageInfoScratch([u8; IMAGE_INFO_SCRATCH]);
+
 impl CrmSdkLibrary {
-    pub fn load<P: libloading::AsFilename>(path: P) -> std::result::Result<Self, libloading::Error> {
+    /// Load `CrmSdk` from `path` and resolve every entry point. This does not
+    /// initialize the SDK; call one of the `initialize_*` methods next.
+    ///
+    /// # Safety
+    ///
+    /// Loading a library runs its initialization code, and every entry point
+    /// is then called through the signature `CrmSdk.h` (CRMSDK 2.10)
+    /// declares. `path` must name a genuine Canon `CrmSdk` build with that
+    /// ABI — `CrmSdk.dll`, `libCrmSdk.so`, or the Mach-O inside
+    /// `CrmSdk.framework`.
+    pub unsafe fn load<P: libloading::AsFilename>(path: P) -> std::result::Result<Self, libloading::Error> {
         unsafe {
             let lib = dl::Library::new(path)?;
             Ok(Self {
@@ -1415,14 +1801,16 @@ impl CrmSdkLibrary {
                 CrmCreateHeaderPack: lib.get(b"CrmCreateHeaderPack\0")?,
                 CrmSetLUTsDirectory: lib.get(b"CrmSetLUTsDirectory\0")?,
 
-                lib,
+                _lib: lib,
             })
         }
     }
 
+    /* ── Initialization ───────────────────────────────────────────────────────────────────────── */
+
     #[inline]
     pub fn initialize_sdk(&self) -> Result<()> {
-        self.err_to_result(unsafe { (self.CrmInitializeSDK)() })
+        sdk_result(unsafe { (self.CrmInitializeSDK)() })
     }
 
     /// CPU-only init (no GPU device handle required).
@@ -1434,38 +1822,50 @@ impl CrmSdkLibrary {
     /// Initialize the SDK against an OpenCL device.
     ///
     /// The SDK's `CrmInitializeSDKWithDevice` accepts a bitmask of
-    /// `kCrmDeviceCpu | kCrmDevice<Gpu>` per `TestCrmSdk.cpp:1308`:
+    /// `kCrmDeviceCpu | kCrmDevice<Gpu>` — spec § 7.2.15 spells it
     /// `(CrmDevice)( kCrmDeviceCpu | kCrmDeviceOpenCl )`. Passing the
     /// GPU bit alone returns `InvalidParameter`.
+    ///
+    /// # Safety
+    ///
+    /// Every handle in `cl` must be a live OpenCL object of the kind its field
+    /// names — a `cl_platform_id`, `device_num` `cl_device_id`s and as many
+    /// `cl_command_queue`s, and a `cl_context` — and they must stay alive
+    /// until the SDK is terminated: it develops on them.
     #[inline]
-    pub fn initialize_with_opencl(&self, cl: &mut ClObject) -> Result<()> {
+    pub unsafe fn initialize_with_opencl(&self, cl: &mut ClObject) -> Result<()> {
         let mask = Device::Cpu as CrmUInt32 | Device::OpenCl as CrmUInt32;
-        self.err_to_result(unsafe {
-            (self.CrmInitializeSDKWithDevice)(mask, cl as *mut _ as *mut CrmVoid)
-        })
+        sdk_result(unsafe { (self.CrmInitializeSDKWithDevice)(mask, cl as *mut _ as *mut CrmVoid) })
     }
 
     /// Initialize the SDK against a CUDA device. Combines `kCrmDeviceCpu |
-    /// kCrmDeviceCuda` per the SDK test code (`TestCrmSdk.cpp:1320`).
+    /// kCrmDeviceCuda`, as Canon's sample code (`TestCrmSdk.cpp`) does.
+    ///
+    /// # Safety
+    ///
+    /// `cuda` must name `device_num` CUDA device ordinals and as many live
+    /// `CUstream`s, and the streams must stay alive until the SDK is
+    /// terminated: it develops on them.
     #[cfg(not(target_vendor = "apple"))]
     #[inline]
-    pub fn initialize_with_cuda(&self, cuda: &mut CudaObject) -> Result<()> {
+    pub unsafe fn initialize_with_cuda(&self, cuda: &mut CudaObject) -> Result<()> {
         let mask = Device::Cpu as CrmUInt32 | Device::Cuda as CrmUInt32;
-        self.err_to_result(unsafe {
-            (self.CrmInitializeSDKWithDevice)(mask, cuda as *mut _ as *mut CrmVoid)
-        })
+        sdk_result(unsafe { (self.CrmInitializeSDKWithDevice)(mask, cuda as *mut _ as *mut CrmVoid) })
     }
 
     /// Initialize the SDK against a Metal device. macOS only. Combines
-    /// `kCrmDeviceCpu | kCrmDeviceMetal` per the SDK test code
-    /// (`TestCrmSdk.cpp:1313`).
+    /// `kCrmDeviceCpu | kCrmDeviceMetal`, as Canon's sample code
+    /// (`TestCrmSdk.cpp`) does.
+    ///
+    /// # Safety
+    ///
+    /// `mtl` must hold a live `id<MTLDevice>` and `id<MTLCommandQueue>`, and
+    /// both must stay alive until the SDK is terminated: it develops on them.
     #[cfg(target_vendor = "apple")]
     #[inline]
-    pub fn initialize_with_metal(&self, mtl: &mut MtlObject) -> Result<()> {
+    pub unsafe fn initialize_with_metal(&self, mtl: &mut MtlObject) -> Result<()> {
         let mask = Device::Cpu as CrmUInt32 | Device::Metal as CrmUInt32;
-        self.err_to_result(unsafe {
-            (self.CrmInitializeSDKWithDevice)(mask, mtl as *mut _ as *mut CrmVoid)
-        })
+        sdk_result(unsafe { (self.CrmInitializeSDKWithDevice)(mask, mtl as *mut _ as *mut CrmVoid) })
     }
 
     /// Escape hatch for callers that already hold a `*mut CrmVoid` of the
@@ -1478,28 +1878,108 @@ impl CrmSdkLibrary {
     /// `in_gpu_param` must point to a struct of the shape the SDK expects
     /// for `in_use_device` — `CudaObject` for the `Cuda` bit, `ClObject`
     /// for the `OpenCl` bit, `MtlObject` for the `Metal` bit, ignored
-    /// for `Cpu`-only. Mismatched shapes are UB inside the SDK. The
-    /// SDK accepts ORed device bits — `kCrmDeviceCpu | kCrmDeviceCuda`
-    /// etc. — so this surface takes a `CrmUInt32` rather than the
-    /// typed `Device` enum.
+    /// for `Cpu`-only — whose handles meet the contract of the matching
+    /// typed constructor. The SDK accepts ORed device bits —
+    /// `kCrmDeviceCpu | kCrmDeviceCuda` etc. — so this surface takes a
+    /// `CrmUInt32` rather than the typed `Device` enum.
     #[doc(hidden)]
     #[inline]
-    pub unsafe fn initialize_sdk_with_device(&self, in_use_device: CrmUInt32, in_gpu_param: *mut CrmVoid) -> Result<()> {
-        self.err_to_result(unsafe { (self.CrmInitializeSDKWithDevice)(in_use_device, in_gpu_param) })
+    pub unsafe fn initialize_sdk_with_device(
+        &self,
+        in_use_device: CrmUInt32,
+        in_gpu_param: *mut CrmVoid,
+    ) -> Result<()> {
+        sdk_result(unsafe { (self.CrmInitializeSDKWithDevice)(in_use_device, in_gpu_param) })
     }
 
+    /// Terminate the SDK, releasing everything it allocated.
+    ///
+    /// Dropping the library does this too, and that is the usual way to end:
+    /// every [`DecodeContext`], [`CrmMemory`] and future holds the library
+    /// through an `Arc`, so the drop cannot come too early.
+    ///
+    /// # Safety
+    ///
+    /// Termination frees every process ref and allocation the SDK made, so
+    /// nothing made through this library may be used — or dropped — after
+    /// it: no [`DecodeContext`], [`CrmMemory`], [`ProcessRef`] or pending
+    /// async job may outlive this call.
     #[inline]
-    pub fn terminate_sdk(&self) -> Result<()> {
-        self.err_to_result(unsafe { (self.CrmTerminateSDK)() })
+    pub unsafe fn terminate_sdk(&self) -> Result<()> {
+        sdk_result(unsafe { (self.CrmTerminateSDK)() })
     }
+
+    /* ── Clip identification ─────────────────────────────────────────────────────────────────── */
 
     #[inline]
     pub fn get_format_id(&self, in_buffer: &[u8]) -> Result<FormatId> {
-        let mut out_format_id = FormatId::MovieType1;
-        let in_data_size = in_buffer.len() as CrmUInt32;
-        self.err_to_result(unsafe { (self.CrmGetFormatId)(in_buffer.as_ptr() as *mut _, in_data_size, &mut out_format_id) })?;
-        Ok(out_format_id)
+        let mut out_format_id: CrmUInt32 = 0;
+        sdk_result(unsafe {
+            (self.CrmGetFormatId)(in_buffer.as_ptr() as *mut _, in_buffer.len() as CrmUInt32, &mut out_format_id)
+        })?;
+        Ok(FormatId::from_raw(out_format_id))
     }
+
+    /// Read one property of a clip, typed by `info`:
+    ///
+    /// ```no_run
+    /// # fn f(sdk: &canon_raw::CrmSdkLibrary, format_id: canon_raw::FormatId, header_pack: &[u8]) -> canon_raw::Result<()> {
+    /// use canon_raw::image_info;
+    ///
+    /// let width: u16 = sdk.get_image_info(format_id, header_pack, image_info::CaptureWidth)?;
+    /// let model: String = sdk.get_image_info(format_id, header_pack, image_info::DeviceModelName)?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// `CrmGetImageInfo` takes no output size: the SDK writes as many bytes as
+    /// the property is wide (spec § 7.4.2), so the output type has to follow
+    /// from the ID. Each key in [`image_info`] carries that type — from spec
+    /// § 8.2, checked against what the SDK actually writes — and the value is
+    /// read out of a zeroed scratch buffer larger than any property.
+    ///
+    /// A property the clip does not carry comes back as
+    /// [`SdkError::InvalidParameter`] (`TotalImageSize`, `Position` and
+    /// `Timecode` on `.CRM` data, for instance).
+    pub fn get_image_info<I: ImageInfo>(&self, format_id: FormatId, header: &[u8], info: I) -> Result<I::Value> {
+        const { assert!(size_of::<I::Raw>() <= IMAGE_INFO_SCRATCH) };
+        let _ = info;
+        let mut scratch = ImageInfoScratch([0; IMAGE_INFO_SCRATCH]);
+        // SAFETY: `scratch` is larger than anything `CrmGetImageInfo` writes
+        // (see `IMAGE_INFO_SCRATCH`).
+        unsafe { self.get_image_info_raw(format_id, header, I::ID as CrmUInt32, scratch.0.as_mut_ptr().cast()) }?;
+        // SAFETY: `I::Raw` is plain data — every bit pattern is a value — and
+        // no larger than the fully initialized scratch buffer.
+        let raw = unsafe { scratch.0.as_ptr().cast::<I::Raw>().read_unaligned() };
+        Ok(I::from_raw(raw))
+    }
+
+    /// `CrmGetImageInfo` with a caller-supplied output, for a property ID
+    /// [`image_info`] does not cover (one added by a newer SDK, say).
+    ///
+    /// # Safety
+    ///
+    /// `out_image_info` must be valid for writes of however many bytes the SDK
+    /// writes for `image_info_id`. The SDK takes no size, so that width is
+    /// the caller's to know; nothing here can check it.
+    pub unsafe fn get_image_info_raw(
+        &self,
+        format_id: FormatId,
+        header: &[u8],
+        image_info_id: CrmUInt32,
+        out_image_info: *mut CrmVoid,
+    ) -> Result<()> {
+        sdk_result(unsafe {
+            (self.CrmGetImageInfo)(
+                format_id.raw(),
+                header.as_ptr() as *mut _,
+                header.len() as CrmUInt32,
+                image_info_id,
+                out_image_info,
+            )
+        })
+    }
+
+    /* ── Process refs and memory ─────────────────────────────────────────────────────────────── */
 
     /// Mint a decode context inside the SDK.
     ///
@@ -1520,8 +2000,8 @@ impl CrmSdkLibrary {
     /// NULLed `DebugInfo`, on a thread whose stack is entirely
     /// `RtlUserThreadStart` → `CrmSdk.dll` → `RtlEnterCriticalSection`. It needs
     /// contention to lose, so it presents as a rare, load-dependent crash with
-    /// no relation to the parameters of the call that preceded it — which is how
-    /// it has already been misattributed once, to `CrmGetOutImageSize`.
+    /// no relation to the parameters of the call that preceded it — easy to
+    /// misattribute to whichever SDK call happened to run last.
     ///
     /// So every release after a decode is a dice roll. One ref held for the life
     /// of a decoder is one roll; one per frame, or per test case, is one each.
@@ -1529,6 +2009,11 @@ impl CrmSdkLibrary {
     /// reset that keeps the pool up and is the right call after a refused
     /// decode. [`DecodeContext`] owns exactly one ref for its whole life for
     /// this reason.
+    ///
+    /// The returned handle records `in_use_device`, which is what makes calls
+    /// on a CUDA ref take the [`cuda_exclusion()`] (spec § 9.2.1) — this one
+    /// included. Every call that takes the handle is `unsafe`, and nothing
+    /// releases it for you; [`DecodeContext`] is the owning wrapper.
     #[inline]
     pub fn create_process_ref(
         &self,
@@ -1539,43 +2024,77 @@ impl CrmSdkLibrary {
         in_max_resolution: Resolution,
     ) -> Result<ProcessRef> {
         let mut out_process_ref = std::ptr::null_mut();
-        self.err_to_result(unsafe {
-            (self.CrmCreateProcessRef)(
-                &mut out_process_ref,
-                in_format_id,
-                in_use_device,
-                in_use_gpu,
-                in_process_type,
-                in_max_resolution,
-            )
+        cuda_exclusion::exclusive_if_cuda(in_use_device, || {
+            sdk_result(unsafe {
+                (self.CrmCreateProcessRef)(
+                    &mut out_process_ref,
+                    in_format_id,
+                    in_use_device,
+                    in_use_gpu,
+                    in_process_type,
+                    in_max_resolution,
+                )
+            })
         })?;
-        Ok(out_process_ref)
+        Ok(ProcessRef { raw: out_process_ref, device: in_use_device })
     }
 
+    /// Reset a process ref between discontinuous decodes (spec § 7.2.4).
+    ///
+    /// # Safety
+    ///
+    /// `in_process_ref` must come from [`create_process_ref`](Self::create_process_ref)
+    /// on this library, not yet released, with no async or queued job still
+    /// pending on it.
     #[inline]
-    pub fn reset_process_ref(&self, in_process_ref: ProcessRef) -> Result<()> {
-        self.err_to_result(unsafe { (self.CrmResetProcessRef)(in_process_ref) })
+    pub unsafe fn reset_process_ref(&self, in_process_ref: ProcessRef) -> Result<()> {
+        sdk_result(unsafe { (self.CrmResetProcessRef)(in_process_ref.as_raw()) })
     }
 
+    /// Release a process ref and everything the SDK allocated for it. See
+    /// [`create_process_ref`](Self::create_process_ref) for why this should
+    /// happen once per decoder, not once per decode.
+    ///
+    /// # Safety
+    ///
+    /// `in_process_ref` must come from [`create_process_ref`](Self::create_process_ref)
+    /// on this library and not have been released already, no async or
+    /// queued job may still be pending on it, and it must not be used again.
     #[inline]
-    pub fn release_process_ref(&self, in_process_ref: ProcessRef) -> Result<()> {
-        self.err_to_result(unsafe { (self.CrmReleaseProcessRef)(in_process_ref) })
+    pub unsafe fn release_process_ref(&self, in_process_ref: ProcessRef) -> Result<()> {
+        cuda_exclusion::exclusive_if_cuda(in_process_ref.device(), || {
+            sdk_result(unsafe { (self.CrmReleaseProcessRef)(in_process_ref.as_raw()) })
+        })
     }
 
+    /// `CrmAllocate`: a buffer for clip data or output. For
+    /// [`Device::Cuda`] this is page-locked host memory (`cudaHostAlloc`,
+    /// spec § 7.2.6), not VRAM. [`CrmMemory::new`] is the owning wrapper.
     #[inline]
     pub fn allocate(&self, in_buffer_size: CrmUInt32, in_use_device: Device) -> Result<*mut CrmVoid> {
         let mut out_buffer: *mut CrmVoid = std::ptr::null_mut();
-        self.err_to_result(unsafe { (self.CrmAllocate)(&mut out_buffer, in_buffer_size, in_use_device) })?;
+        sdk_result(unsafe { (self.CrmAllocate)(&mut out_buffer, in_buffer_size, in_use_device) })?;
         Ok(out_buffer)
     }
 
+    /// # Safety
+    ///
+    /// `in_buffer` must come from [`allocate`](Self::allocate) on this library
+    /// with the same `in_use_device`, not be freed already, and not be in use
+    /// by a pending job.
     #[inline]
-    pub fn deallocate(&self, in_buffer: *mut CrmVoid, in_use_device: Device) -> Result<()> {
-        self.err_to_result(unsafe { (self.CrmDeallocate)(in_buffer, in_use_device) })
+    pub unsafe fn deallocate(&self, in_buffer: *mut CrmVoid, in_use_device: Device) -> Result<()> {
+        sdk_result(unsafe { (self.CrmDeallocate)(in_buffer, in_use_device) })
     }
 
+    /// `CrmDeviceAllocate`: a buffer in VRAM (spec § 7.2.16).
+    ///
+    /// # Safety
+    ///
+    /// `in_process_ref` must be a live ref from [`create_process_ref`](Self::create_process_ref)
+    /// on this library.
     #[inline]
-    pub fn device_allocate(
+    pub unsafe fn device_allocate(
         &self,
         in_process_ref: ProcessRef,
         in_buffer_size: CrmUInt32,
@@ -1583,19 +2102,58 @@ impl CrmSdkLibrary {
         in_use_gpu: Gpu,
     ) -> Result<*mut CrmVoid> {
         let mut out_buffer: *mut CrmVoid = std::ptr::null_mut();
-        self.err_to_result(unsafe {
-            (self.CrmDeviceAllocate)(in_process_ref, &mut out_buffer, in_buffer_size, in_buffer_type, in_use_gpu)
+        sdk_result(unsafe {
+            (self.CrmDeviceAllocate)(
+                in_process_ref.as_raw(),
+                &mut out_buffer,
+                in_buffer_size,
+                in_buffer_type,
+                in_use_gpu,
+            )
         })?;
         Ok(out_buffer)
     }
 
+    /// # Safety
+    ///
+    /// `in_process_ref` must be the live ref `in_buffer` was allocated
+    /// against with [`device_allocate`](Self::device_allocate); `in_buffer`
+    /// must not be freed already, and not be in use by pending work.
     #[inline]
-    pub fn device_deallocate(&self, in_process_ref: ProcessRef, in_buffer: *mut CrmVoid) -> Result<()> {
-        self.err_to_result(unsafe { (self.CrmDeviceDeallocate)(in_process_ref, in_buffer) })
+    pub unsafe fn device_deallocate(&self, in_process_ref: ProcessRef, in_buffer: *mut CrmVoid) -> Result<()> {
+        sdk_result(unsafe { (self.CrmDeviceDeallocate)(in_process_ref.as_raw(), in_buffer) })
     }
 
+    /* ── Decoding ─────────────────────────────────────────────────────────────────────────────── */
+
+    /// `CrmGetImage`: decompress and/or develop one frame. Returns the number
+    /// of bytes the SDK reports it produced.
+    ///
+    /// [`DecodeContext::decode_frame_cpu_into`] is the safe form for a CPU
+    /// destination.
+    ///
+    /// # Safety
+    ///
+    /// * `in_process_ref` is a live ref from [`create_process_ref`](Self::create_process_ref)
+    ///   on this library, with no other decode running on it.
+    /// * `out_dst_buffer` lives in the memory domain `in_res_param.out_buffer_type`
+    ///   names — a host pointer for `Cpu`, a `CUdeviceptr` for `Cuda`, a
+    ///   `cl_mem` for `OpenCl`, an `id<MTLBuffer>` for `Metal` — and is valid
+    ///   for writes of `in_dst_buffer_size` bytes.
+    /// * For a GPU domain, `in_dst_buffer_size` must also be at least the
+    ///   size the recipe produces. Measured on CRMSDK 2.10: the CPU path
+    ///   honours `in_dst_buffer_size` (and writes nothing at all, while still
+    ///   returning `CRM_ERR_OK`, when it is too small); a CUDA destination is
+    ///   written to its full output size whatever this argument says.
+    /// * For a GPU domain, the SDK's device work can still be writing the
+    ///   destination when this returns: the buffer must stay allocated until
+    ///   the stream or queue the SDK was initialized with has been
+    ///   synchronized.
+    ///
+    /// On a CUDA ref this runs under the [`cuda_exclusion()`] (spec § 9.2.1).
     #[inline]
-    pub fn get_image(
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn get_image(
         &self,
         in_process_ref: ProcessRef,
         out_dst_buffer: *mut CrmVoid,
@@ -1610,29 +2168,54 @@ impl CrmSdkLibrary {
         in_header_buffer: &[u8],
     ) -> Result<u32> {
         let mut out_dst_data_size = 0;
-        self.err_to_result(unsafe {
-            (self.CrmGetImage)(
-                in_process_ref,
-                out_dst_buffer,
-                in_dst_buffer_size,
-                &mut out_dst_data_size,
-                in_bits_per_sample,
-                in_samples_per_pixel,
-                in_bytes_per_line,
-                in_sample_sequence as _,
-                in_src_buffer.as_ptr() as *mut CrmVoid,
-                in_src_buffer.len() as CrmUInt32,
-                in_dev_param as *const _ as *mut CrmVoid,
-                in_res_param as *const _ as *mut CrmVoid,
-                in_header_buffer.as_ptr() as *mut CrmVoid,
-                in_header_buffer.len() as CrmUInt32,
-            )
+        cuda_exclusion::exclusive_if_cuda(in_process_ref.device(), || {
+            sdk_result(unsafe {
+                (self.CrmGetImage)(
+                    in_process_ref.as_raw(),
+                    out_dst_buffer,
+                    in_dst_buffer_size,
+                    &mut out_dst_data_size,
+                    in_bits_per_sample,
+                    in_samples_per_pixel,
+                    in_bytes_per_line,
+                    in_sample_sequence as _,
+                    in_src_buffer.as_ptr() as *mut CrmVoid,
+                    in_src_buffer.len() as CrmUInt32,
+                    in_dev_param as *const _ as *mut CrmVoid,
+                    in_res_param as *const _ as *mut CrmVoid,
+                    in_header_buffer.as_ptr() as *mut CrmVoid,
+                    in_header_buffer.len() as CrmUInt32,
+                )
+            })
         })?;
         Ok(out_dst_data_size)
     }
 
+    /// `CrmGetImageAsync`, verbatim: the caller supplies the callback and
+    /// `in_ref_con`. [`get_image_future`](Self::get_image_future) and
+    /// [`get_image_future_owned`](Self::get_image_future_owned) are the
+    /// future-based forms.
+    ///
+    /// At most three jobs may be in flight per process ref; a fourth fails
+    /// with [`SdkError::DecompressNoResource`]. Measured on CRMSDK 2.10, the
+    /// SDK accepts this call only on a DECOMPRESS-only ref: a combined
+    /// `DEVELOP | DECOMPRESS` ref is refused with *"CrmGetImageAsync can
+    /// execute either decompress or develop processing asynchronously."* and
+    /// a DEVELOP-only one with *"CrmGetImageAsync cannot execute develop
+    /// processing asynchronously."*.
+    ///
+    /// # Safety
+    ///
+    /// Everything [`get_image`](Self::get_image) requires, for as long as the
+    /// job runs — until `in_func` has been called — rather than for the call:
+    /// the source, parameter and header pointers must stay valid and
+    /// unmodified, the destination valid, and the returned token alive. Each
+    /// pointer must cover the size passed with it. `in_func`, if any, must be
+    /// sound to call once from an SDK worker thread with `in_ref_con`; with
+    /// `None` the call runs synchronously.
     #[inline]
-    pub fn get_image_async_raw(
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn get_image_async_raw(
         &self,
         in_process_ref: ProcessRef,
         out_dst_buffer: *mut CrmVoid,
@@ -1653,12 +2236,13 @@ impl CrmSdkLibrary {
         let mut token = GetImageAsyncToken { dst_data_size: Box::new(0) };
         let out_dst_data_size = &mut *token.dst_data_size as *mut CrmUInt32;
 
-        let async_fn = self.CrmGetImageAsync.as_ref().ok_or(CrmError::MissingData(
-            "CrmGetImageAsync is not available in this Canon SDK build",
-        ))?;
-        self.err_to_result(unsafe {
+        let async_fn = self
+            .CrmGetImageAsync
+            .as_ref()
+            .ok_or(CrmError::MissingData("CrmGetImageAsync is not available in this Canon SDK build"))?;
+        sdk_result(unsafe {
             (async_fn)(
-                in_process_ref,
+                in_process_ref.as_raw(),
                 out_dst_buffer,
                 in_dst_buffer_size,
                 out_dst_data_size,
@@ -1690,33 +2274,34 @@ impl CrmSdkLibrary {
     /// # Safety
     /// Every pointer must stay valid until the returned state's callback
     /// fires; the caller owns keeping the backing allocations alive (via
-    /// the future's keepalive fields).
+    /// the future, whose `Drop` waits for the callback).
     #[allow(clippy::too_many_arguments)]
     unsafe fn submit_get_image_async(
         &self,
-        in_process_ref:       ProcessRef,
-        out_dst_buffer:       *mut CrmVoid,
-        in_dst_buffer_size:   CrmUInt32,
-        out_dst_data_size:    *mut CrmUInt32,
-        in_bits_per_sample:   CrmUInt32,
+        in_process_ref: ProcessRef,
+        out_dst_buffer: *mut CrmVoid,
+        in_dst_buffer_size: CrmUInt32,
+        out_dst_data_size: *mut CrmUInt32,
+        in_bits_per_sample: CrmUInt32,
         in_samples_per_pixel: CrmUInt32,
-        in_bytes_per_line:    CrmUInt32,
-        in_sample_sequence:   CrmUInt32,
-        src_ptr:              *mut CrmVoid,
-        src_size:             CrmUInt32,
-        dev_param:            *mut CrmVoid,
-        res_param:            *mut CrmVoid,
-        header_ptr:           *mut CrmVoid,
-        header_size:          CrmUInt32,
+        in_bytes_per_line: CrmUInt32,
+        in_sample_sequence: CrmUInt32,
+        src_ptr: *mut CrmVoid,
+        src_size: CrmUInt32,
+        dev_param: *mut CrmVoid,
+        res_param: *mut CrmVoid,
+        header_ptr: *mut CrmVoid,
+        header_size: CrmUInt32,
     ) -> Result<Arc<GetImageAsyncState>> {
-        let async_fn = self.CrmGetImageAsync.as_ref().ok_or(CrmError::MissingData(
-            "CrmGetImageAsync is not available in this Canon SDK build",
-        ))?;
+        let async_fn = self
+            .CrmGetImageAsync
+            .as_ref()
+            .ok_or(CrmError::MissingData("CrmGetImageAsync is not available in this Canon SDK build"))?;
         let state = Arc::new(GetImageAsyncState::new());
         let ref_con = Arc::into_raw(state.clone()) as *mut CrmVoid;
-        let submit_res = self.err_to_result(unsafe {
+        let submit_res = sdk_result(unsafe {
             (async_fn)(
-                in_process_ref,
+                in_process_ref.as_raw(),
                 out_dst_buffer,
                 in_dst_buffer_size,
                 out_dst_data_size,
@@ -1735,13 +2320,29 @@ impl CrmSdkLibrary {
             )
         });
         if let Err(e) = submit_res {
+            // The SDK refused the job, so it never calls back: take its
+            // refcount back.
             unsafe { drop(Arc::from_raw(ref_con as *const GetImageAsyncState)) };
             return Err(e);
         }
         Ok(state)
     }
 
-    pub fn get_image_future<'a>(
+    /// Submit `CrmGetImageAsync` and return a future for the job, borrowing
+    /// its inputs. See [`get_image_async_raw`](Self::get_image_async_raw) for
+    /// which process refs the SDK accepts this on.
+    ///
+    /// # Safety
+    ///
+    /// * `in_process_ref` is a live ref from [`create_process_ref`](Self::create_process_ref)
+    ///   on this library.
+    /// * `out_dst_buffer` meets [`get_image`](Self::get_image)'s destination
+    ///   contract, and stays valid until the future has completed or been
+    ///   dropped — dropping it waits for the job.
+    /// * The future must not be leaked (`mem::forget`): its `Drop` is what
+    ///   keeps the borrowed inputs alive until the SDK has finished with them.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn get_image_future<'a>(
         &'a self,
         in_process_ref: ProcessRef,
         out_dst_buffer: *mut CrmVoid,
@@ -1756,9 +2357,9 @@ impl CrmSdkLibrary {
         in_header_buffer: &'a [u8],
     ) -> Result<GetImageFuture<'a>> {
         let mut out_dst_data_size = Box::new(0u32);
-        // SAFETY: every pointer is derived from a `&'a` borrow that
-        // outlives the returned future, so all stay valid until the
-        // callback fires.
+        // SAFETY: the inputs are borrowed for `'a`, which the future carries,
+        // and its `Drop` waits for the job; the destination and the ref are
+        // the caller's contract.
         let state = unsafe {
             self.submit_get_image_async(
                 in_process_ref,
@@ -1778,15 +2379,7 @@ impl CrmSdkLibrary {
             )?
         };
 
-        Ok(GetImageFuture {
-            sdk: self,
-            state,
-            _out_dst_data_size: out_dst_data_size,
-            _in_src_buffer: in_src_buffer,
-            _in_dev_param: in_dev_param,
-            _in_res_param: in_res_param,
-            _in_header_buffer: in_header_buffer,
-        })
+        Ok(GetImageFuture { state, _out_dst_data_size: out_dst_data_size, _inputs: PhantomData })
     }
 
     /// `'static` owned-source counterpart to [`get_image_future`](Self::get_image_future).
@@ -1803,30 +2396,33 @@ impl CrmSdkLibrary {
     /// RGBA16 output), matching `CrmGetImageAsync`'s untyped parameter.
     ///
     /// # Safety
+    /// - `in_process_ref` is a live ref from [`create_process_ref`](Self::create_process_ref)
+    ///   on this library.
     /// - `src_ptr` (`src_size` bytes) and `header_ptr` (`header_size` bytes)
     ///   must point into the live allocations owned by `src_keep` / `hdr_keep`.
-    /// - `out_dst_buffer` (`in_dst_buffer_size` bytes) must remain valid and
-    ///   writable until the returned future resolves — the SDK writes the
-    ///   result there asynchronously. The caller owns it (e.g. a pipeline
-    ///   output-slot keepalive on the same ticket as this future).
+    /// - `out_dst_buffer` (`in_dst_buffer_size` bytes) meets
+    ///   [`get_image`](Self::get_image)'s destination contract and stays valid
+    ///   until the future has completed or been dropped — dropping it waits
+    ///   for the job. The caller owns it (e.g. a pipeline output-slot
+    ///   keepalive dropped after the future).
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn get_image_future_owned(
         self: &Arc<Self>,
-        in_process_ref:     ProcessRef,
-        out_dst_buffer:     *mut CrmVoid,
+        in_process_ref: ProcessRef,
+        out_dst_buffer: *mut CrmVoid,
         in_dst_buffer_size: CrmUInt32,
         in_bits_per_sample: CrmUInt32,
         in_samples_per_pixel: CrmUInt32,
-        in_bytes_per_line:  CrmUInt32,
+        in_bytes_per_line: CrmUInt32,
         in_sample_sequence: CrmUInt32,
-        src_ptr:            *const u8,
-        src_size:           CrmUInt32,
-        in_dev_param:       Box<DevParamV13>,
-        in_res_param:       Box<ResParamV13>,
-        header_ptr:         *const u8,
-        header_size:        CrmUInt32,
-        src_keep:           Box<dyn core::any::Any + Send>,
-        hdr_keep:           Box<dyn core::any::Any + Send>,
+        src_ptr: *const u8,
+        src_size: CrmUInt32,
+        in_dev_param: Box<DevParamV13>,
+        in_res_param: Box<ResParamV13>,
+        header_ptr: *const u8,
+        header_size: CrmUInt32,
+        src_keep: Box<dyn core::any::Any + Send>,
+        hdr_keep: Box<dyn core::any::Any + Send>,
     ) -> Result<OwnedGetImageFuture> {
         let mut out_dst_data_size = Box::new(0u32);
         let state = unsafe {
@@ -1849,17 +2445,24 @@ impl CrmSdkLibrary {
         };
 
         Ok(OwnedGetImageFuture {
-            sdk:                self.clone(),
             state,
+            _sdk: self.clone(),
             _out_dst_data_size: out_dst_data_size,
-            _dev_param:         in_dev_param,
-            _res_param:         in_res_param,
-            _src_keep:          src_keep,
-            _hdr_keep:          hdr_keep,
+            _dev_param: in_dev_param,
+            _res_param: in_res_param,
+            _src_keep: src_keep,
+            _hdr_keep: hdr_keep,
         })
     }
 
-    pub async fn get_image_async(
+    /// [`get_image_future`](Self::get_image_future), awaited.
+    ///
+    /// # Safety
+    ///
+    /// As for [`get_image_future`](Self::get_image_future): the returned
+    /// future must not be leaked.
+    #[allow(clippy::too_many_arguments)]
+    pub async unsafe fn get_image_async(
         &self,
         in_process_ref: ProcessRef,
         out_dst_buffer: *mut CrmVoid,
@@ -1873,24 +2476,42 @@ impl CrmSdkLibrary {
         in_res_param: &ResParamV13,
         in_header_buffer: &[u8],
     ) -> Result<GetImageAsyncOutput> {
-        self.get_image_future(
-            in_process_ref,
-            out_dst_buffer,
-            in_dst_buffer_size,
-            in_bits_per_sample,
-            in_samples_per_pixel,
-            in_bytes_per_line,
-            in_sample_sequence,
-            in_src_buffer,
-            in_dev_param,
-            in_res_param,
-            in_header_buffer,
-        )?
+        unsafe {
+            self.get_image_future(
+                in_process_ref,
+                out_dst_buffer,
+                in_dst_buffer_size,
+                in_bits_per_sample,
+                in_samples_per_pixel,
+                in_bytes_per_line,
+                in_sample_sequence,
+                in_src_buffer,
+                in_dev_param,
+                in_res_param,
+                in_header_buffer,
+            )
+        }?
         .await
     }
 
+    /// `CrmEnqueueImage`: submit a frame to the SDK's development queue
+    /// (spec § 7.3.2). The queue is CPU-output only.
+    ///
+    /// # Safety
+    ///
+    /// * `in_process_ref` is a live ref from [`create_process_ref`](Self::create_process_ref)
+    ///   on this library.
+    /// * `in_src_buffer` points to `in_src_data_size` bytes allocated with
+    ///   [`allocate`](Self::allocate) — a plain Rust allocation faults the
+    ///   SDK's worker — and stays valid and unmodified until
+    ///   [`dequeue_image`](Self::dequeue_image) has handed back this
+    ///   submission's `in_ref_con`: the SDK keeps the pointer, not a copy.
+    /// * `in_header_buffer` points to `in_header_data_size` readable bytes for
+    ///   the duration of the call.
+    /// * A null `in_src_buffer` with size `0` is the end-of-stream marker.
     #[inline]
-    pub fn enqueue_image(
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn enqueue_image(
         &self,
         in_process_ref: ProcessRef,
         in_bits_per_sample: CrmUInt32,
@@ -1905,26 +2526,37 @@ impl CrmSdkLibrary {
         in_header_buffer: *mut CrmVoid,
         in_header_data_size: CrmUInt32,
     ) -> Result<()> {
-        self.err_to_result(unsafe {
-            (self.CrmEnqueueImage)(
-                in_process_ref,
-                in_bits_per_sample,
-                in_samples_per_pixel,
-                in_bytes_per_line,
-                in_sample_sequence,
-                in_src_buffer,
-                in_src_data_size,
-                in_dev_param as *const _ as *mut CrmVoid,
-                in_res_param as *const _ as *mut CrmVoid,
-                in_ref_con,
-                in_header_buffer,
-                in_header_data_size,
-            )
+        cuda_exclusion::exclusive_if_cuda(in_process_ref.device(), || {
+            sdk_result(unsafe {
+                (self.CrmEnqueueImage)(
+                    in_process_ref.as_raw(),
+                    in_bits_per_sample,
+                    in_samples_per_pixel,
+                    in_bytes_per_line,
+                    in_sample_sequence,
+                    in_src_buffer,
+                    in_src_data_size,
+                    in_dev_param as *const _ as *mut CrmVoid,
+                    in_res_param as *const _ as *mut CrmVoid,
+                    in_ref_con,
+                    in_header_buffer,
+                    in_header_data_size,
+                )
+            })
         })
     }
 
+    /// `CrmDequeueImage`: collect a developed frame from the queue. Returns
+    /// the bytes written and the submission's `in_ref_con`.
+    ///
+    /// # Safety
+    ///
+    /// `in_process_ref` is a live ref from [`create_process_ref`](Self::create_process_ref)
+    /// on this library, and `out_dst_buffer` is a CPU buffer valid for writes
+    /// of `in_dst_buffer_size` bytes, at least the size one developed frame
+    /// takes.
     #[inline]
-    pub fn dequeue_image(
+    pub unsafe fn dequeue_image(
         &self,
         in_process_ref: ProcessRef,
         out_dst_buffer: *mut CrmVoid,
@@ -1932,235 +2564,233 @@ impl CrmSdkLibrary {
     ) -> Result<(CrmUInt32, *mut CrmVoid)> {
         let mut out_dst_data_size = 0;
         let mut out_ref_con: *mut CrmVoid = core::ptr::null_mut();
-        self.err_to_result(unsafe {
-            (self.CrmDequeueImage)(
-                in_process_ref,
-                out_dst_buffer,
-                in_dst_buffer_size,
-                &mut out_dst_data_size,
-                &mut out_ref_con,
-            )
+        cuda_exclusion::exclusive_if_cuda(in_process_ref.device(), || {
+            sdk_result(unsafe {
+                (self.CrmDequeueImage)(
+                    in_process_ref.as_raw(),
+                    out_dst_buffer,
+                    in_dst_buffer_size,
+                    &mut out_dst_data_size,
+                    &mut out_ref_con,
+                )
+            })
         })?;
         Ok((out_dst_data_size, out_ref_con))
     }
 
-    /// Read a typed CRM image-info property.
-    ///
-    /// **Important:** the SDK only writes `sizeof(spec_type)` bytes into
-    /// the output — and several properties are narrower than the natural
-    /// Rust scalar choice (`kCrmImageInfoId_CaptureWidth` is `CrmUInt16`,
-    /// `kCrmImageInfoId_BitDepth` is `CrmUInt8`, etc., per the CRMSDK
-    /// Interface Spec § 8.2). The C++ test code papers over this by
-    /// initialising the host variable to zero (`int captureWidth = 0;`)
-    /// so the un-written high bytes read as 0; this helper does the same
-    /// via `MaybeUninit::zeroed()`, so callers that pass a wider `T`
-    /// than the spec's exact type still see the correct numeric value.
-    ///
-    /// Even with that safety net, prefer the spec's exact type (e.g.
-    /// `u16` for `CaptureWidth`) — wider types only work for plain
-    /// integers / booleans, not for compound output shapes (the 9-float
-    /// `ColorMatrix`, the rational `WBGain_Denominator`, etc.).
-    #[inline]
-    pub fn get_image_info<T>(&self, format_id: FormatId, in_buffer: &[u8], image_info_id: ImageInfoId) -> Result<T> {
-        let mut out_image_info = core::mem::MaybeUninit::<T>::zeroed();
-        self.err_to_result(unsafe { (self.CrmGetImageInfo)(format_id as CrmUInt32, in_buffer.as_ptr() as *mut _, in_buffer.len() as CrmUInt32, image_info_id, out_image_info.as_mut_ptr() as *mut _) })?;
-        Ok(unsafe { out_image_info.assume_init() })
-    }
+    /* ── System and process information ──────────────────────────────────────────────────────── */
 
     #[inline]
     pub fn get_gpu_system_info(&self) -> Result<(GpuSystemInfo, GpuSystemInfo)> {
-        let mut out_cuda_gpu_system_info = core::mem::MaybeUninit::<GpuSystemInfo>::uninit();
-        let mut out_cl_gpu_system_info = core::mem::MaybeUninit::<GpuSystemInfo>::uninit();
-        self.err_to_result(unsafe {
-            (self.CrmGetGpuSystemInfo)(
-                out_cuda_gpu_system_info.as_mut_ptr(),
-                out_cl_gpu_system_info.as_mut_ptr(),
-            )
-        })?;
-        Ok(unsafe {
-            (
-                out_cuda_gpu_system_info.assume_init(),
-                out_cl_gpu_system_info.assume_init(),
-            )
-        })
+        let mut out_cuda_gpu_system_info = GpuSystemInfo::default();
+        let mut out_cl_gpu_system_info = GpuSystemInfo::default();
+        sdk_result(unsafe { (self.CrmGetGpuSystemInfo)(&mut out_cuda_gpu_system_info, &mut out_cl_gpu_system_info) })?;
+        Ok((out_cuda_gpu_system_info, out_cl_gpu_system_info))
     }
 
+    /// The CUDA and OpenCL device lists (the deprecated `CrmGetGpuInfoList`;
+    /// prefer [`get_gpu_info_list_with_device`](Self::get_gpu_info_list_with_device)).
     #[inline]
     pub fn get_gpu_info_list(&self) -> Result<(Vec<GpuInfo>, Vec<GpuInfo>)> {
-        const MAX_GPU_NUM: usize = 8;
-
         let (cuda_sys, cl_sys) = self.get_gpu_system_info()?;
-        let cuda_len = (cuda_sys.device_num as usize).min(MAX_GPU_NUM);
-        let cl_len = (cl_sys.device_num as usize).min(MAX_GPU_NUM);
-
-        let mut cuda_infos: [core::mem::MaybeUninit<GpuInfo>; MAX_GPU_NUM] = core::array::from_fn(|_| core::mem::MaybeUninit::uninit());
-        let mut cl_infos: [core::mem::MaybeUninit<GpuInfo>; MAX_GPU_NUM] = core::array::from_fn(|_| core::mem::MaybeUninit::uninit());
-
-        self.err_to_result(unsafe {
-            (self.CrmGetGpuInfoList)(
-                cuda_infos.as_mut_ptr() as *mut GpuInfo,
-                cl_infos.as_mut_ptr() as *mut GpuInfo,
-            )
-        })?;
-
-        let cuda = cuda_infos[..cuda_len].iter().map(|x| unsafe { x.assume_init() }).collect();
-        let cl   =   cl_infos[..cl_len]  .iter().map(|x| unsafe { x.assume_init() }).collect();
-
+        // The SDK writes one entry per device it reported, with no size
+        // argument, so each list is sized from that count.
+        let mut cuda = vec![GpuInfo::ZEROED; (cuda_sys.device_num as usize).max(1)];
+        let mut cl = vec![GpuInfo::ZEROED; (cl_sys.device_num as usize).max(1)];
+        sdk_result(unsafe { (self.CrmGetGpuInfoList)(cuda.as_mut_ptr(), cl.as_mut_ptr()) })?;
+        cuda.truncate(cuda_sys.device_num as usize);
+        cl.truncate(cl_sys.device_num as usize);
         Ok((cuda, cl))
     }
 
     #[inline]
     pub fn get_sdk_info(&self) -> Result<(Version, CrmUInt32, CrmUInt32)> {
-        let mut out_sdk_version = core::mem::MaybeUninit::<Version>::uninit();
-        let mut out_pipeline_num = core::mem::MaybeUninit::<CrmUInt32>::uninit();
-        let mut out_usable_gpu_num = core::mem::MaybeUninit::<CrmUInt32>::uninit();
-        self.err_to_result(unsafe {
-            (self.CrmGetSdkInfo)(
-                out_sdk_version.as_mut_ptr(),
-                out_pipeline_num.as_mut_ptr(),
-                out_usable_gpu_num.as_mut_ptr(),
-            )
+        let mut out_sdk_version = Version::default();
+        let mut out_pipeline_num = 0;
+        let mut out_usable_gpu_num = 0;
+        sdk_result(unsafe {
+            (self.CrmGetSdkInfo)(&mut out_sdk_version, &mut out_pipeline_num, &mut out_usable_gpu_num)
         })?;
-        Ok(unsafe {
-            (
-                out_sdk_version.assume_init(),
-                out_pipeline_num.assume_init(),
-                out_usable_gpu_num.assume_init(),
-            )
-        })
+        Ok((out_sdk_version, out_pipeline_num, out_usable_gpu_num))
+    }
+
+    /// The white-balance gain the last click-WB develop applied (spec § 7.4.6).
+    ///
+    /// # Safety
+    ///
+    /// `in_process_ref` is a live ref from [`create_process_ref`](Self::create_process_ref)
+    /// on this library.
+    #[inline]
+    pub unsafe fn get_wb_gain(&self, in_process_ref: ProcessRef) -> Result<WbGain> {
+        let mut out_wb_gain = WbGain::default();
+        sdk_result(unsafe { (self.CrmGetWBGain)(in_process_ref.as_raw(), &mut out_wb_gain) })?;
+        Ok(out_wb_gain)
+    }
+
+    /// The ACES IDT the last develop applied (spec § 7.4.7).
+    ///
+    /// # Safety
+    ///
+    /// `in_process_ref` is a live ref from [`create_process_ref`](Self::create_process_ref)
+    /// on this library.
+    #[inline]
+    pub unsafe fn get_aces_idt(&self, in_process_ref: ProcessRef) -> Result<AcesIdtInfo> {
+        // `outAcesIDTStr` takes no size. CRMSDK 2.10 writes a short
+        // NUL-terminated name ("D55 Ver. 2.0" is 13 bytes); the buffer leaves
+        // generous room, and the zeroing bounds the read either way.
+        let mut raw: CrmUInt32 = 0;
+        let mut name = [0u8; 1024];
+        sdk_result(unsafe { (self.CrmGetAcesIDT)(in_process_ref.as_raw(), &mut raw, name.as_mut_ptr().cast()) })?;
+        Ok(AcesIdtInfo { raw, name: fixed_ascii(&name) })
     }
 
     #[inline]
-    pub fn get_wb_gain(&self, in_process_ref: ProcessRef) -> Result<WbGain> {
-        let mut out_wb_gain = core::mem::MaybeUninit::<WbGain>::uninit();
-        self.err_to_result(unsafe { (self.CrmGetWBGain)(in_process_ref, out_wb_gain.as_mut_ptr()) })?;
-        Ok(unsafe { out_wb_gain.assume_init() })
-    }
-
-    #[inline]
-    pub fn get_aces_idt(&self, in_process_ref: ProcessRef) -> Result<(AcesIdt, String)> {
-        use std::ffi::CStr;
-
-        let mut out_aces_idt = core::mem::MaybeUninit::<AcesIdt>::uninit();
-        let mut out_aces_idt_str = [0 as CrmASCII; 256];
-        self.err_to_result(unsafe {
-            (self.CrmGetAcesIDT)(
-                in_process_ref,
-                out_aces_idt.as_mut_ptr(),
-                out_aces_idt_str.as_mut_ptr(),
-            )
-        })?;
-
-        let idt = unsafe { out_aces_idt.assume_init() };
-        let cstr = unsafe { CStr::from_ptr(out_aces_idt_str.as_ptr()) };
-        Ok((idt, cstr.to_string_lossy().into_owned()))
-    }
-
-    #[inline]
-    pub fn get_sdk_info_with_device(&self, in_use_device: Device, in_process_type: ProcessType) -> Result<(Version, CrmUInt32, CrmUInt32)> {
-        let mut out_sdk_version = core::mem::MaybeUninit::<Version>::uninit();
-        let mut out_pipeline_num = core::mem::MaybeUninit::<CrmUInt32>::uninit();
-        let mut out_usable_gpu_num = core::mem::MaybeUninit::<CrmUInt32>::uninit();
-
-        self.err_to_result(unsafe {
+    pub fn get_sdk_info_with_device(
+        &self,
+        in_use_device: Device,
+        in_process_type: ProcessType,
+    ) -> Result<(Version, CrmUInt32, CrmUInt32)> {
+        let mut out_sdk_version = Version::default();
+        let mut out_pipeline_num = 0;
+        let mut out_usable_gpu_num = 0;
+        sdk_result(unsafe {
             (self.CrmGetSdkInfoWithDevice)(
-                out_sdk_version.as_mut_ptr(),
-                out_pipeline_num.as_mut_ptr(),
-                out_usable_gpu_num.as_mut_ptr(),
+                &mut out_sdk_version,
+                &mut out_pipeline_num,
+                &mut out_usable_gpu_num,
                 in_use_device,
                 in_process_type,
             )
         })?;
-
-        Ok(unsafe {
-            (
-                out_sdk_version.assume_init(),
-                out_pipeline_num.assume_init(),
-                out_usable_gpu_num.assume_init(),
-            )
-        })
+        Ok((out_sdk_version, out_pipeline_num, out_usable_gpu_num))
     }
 
     #[inline]
     pub fn get_gpu_system_info_with_device(&self, in_use_device: Device) -> Result<GpuSystemInfo> {
-        let mut out = core::mem::MaybeUninit::<GpuSystemInfo>::uninit();
-        self.err_to_result(unsafe { (self.CrmGetGpuSystemInfoWithDevice)(out.as_mut_ptr(), in_use_device) })?;
-        Ok(unsafe { out.assume_init() })
+        let mut out = GpuSystemInfo::default();
+        sdk_result(unsafe { (self.CrmGetGpuSystemInfoWithDevice)(&mut out, in_use_device) })?;
+        Ok(out)
     }
 
     #[inline]
     pub fn get_gpu_info_list_with_device(&self, in_use_device: Device) -> Result<Vec<GpuInfo>> {
-        let info = self.get_gpu_system_info_with_device(in_use_device)?;
-        let mut out = Vec::with_capacity(info.device_num as usize);
-        unsafe { out.set_len(info.device_num as usize); }
-        self.err_to_result(unsafe { (self.CrmGetGpuInfoListWithDevice)(out.as_mut_ptr(), in_use_device) })?;
+        let count = self.get_gpu_system_info_with_device(in_use_device)?.device_num as usize;
+        // One entry per device the SDK just reported — it writes exactly that
+        // many and takes no size argument.
+        let mut out = vec![GpuInfo::ZEROED; count.max(1)];
+        sdk_result(unsafe { (self.CrmGetGpuInfoListWithDevice)(out.as_mut_ptr(), in_use_device) })?;
+        out.truncate(count);
         Ok(out)
     }
 
+    /* ── Intel GPU development (spec § 7.2.8 – 7.2.13: not supported by CRMSDK 2.10) ───────────── */
+
+    /// # Safety
+    ///
+    /// `in_process_ref` is a live ref from [`create_process_ref`](Self::create_process_ref)
+    /// on this library, and `in_device_handle` a live device manager of the
+    /// kind `in_mem_type` names.
     #[cfg(target_os = "windows")]
     #[inline]
-    pub fn set_device_handle_for_intel(&self, in_process_ref: ProcessRef, in_device_handle: DeviceHandle, in_mem_type: MemType) -> Result<()> {
-        self.err_to_result(unsafe { (self.CrmSetDeviceHandleForIntel)(in_process_ref, in_device_handle, in_mem_type) })
+    pub unsafe fn set_device_handle_for_intel(
+        &self,
+        in_process_ref: ProcessRef,
+        in_device_handle: DeviceHandle,
+        in_mem_type: MemType,
+    ) -> Result<()> {
+        sdk_result(unsafe { (self.CrmSetDeviceHandleForIntel)(in_process_ref.as_raw(), in_device_handle, in_mem_type) })
     }
 
+    /// # Safety
+    ///
+    /// `in_process_ref` is a live ref from [`create_process_ref`](Self::create_process_ref)
+    /// on this library.
     #[cfg(target_os = "windows")]
     #[inline]
-    pub fn set_image_param_for_intel(&self, in_process_ref: ProcessRef, in_resolution: Size, in_crop: Rect) -> Result<()> {
-        self.err_to_result(unsafe { (self.CrmSetImageParamForIntel)(in_process_ref, in_resolution, in_crop) })
+    pub unsafe fn set_image_param_for_intel(
+        &self,
+        in_process_ref: ProcessRef,
+        in_resolution: Size,
+        in_crop: Rect,
+    ) -> Result<()> {
+        sdk_result(unsafe { (self.CrmSetImageParamForIntel)(in_process_ref.as_raw(), in_resolution, in_crop) })
     }
 
+    /// # Safety
+    ///
+    /// `in_process_ref` is a live ref from [`create_process_ref`](Self::create_process_ref)
+    /// on this library.
     #[cfg(target_os = "windows")]
     #[inline]
-    pub fn allocate_d3d_surfaces_for_intel(&self, in_process_ref: ProcessRef) -> Result<[MemId; SURFACE_NUM as usize]> {
+    pub unsafe fn allocate_d3d_surfaces_for_intel(
+        &self,
+        in_process_ref: ProcessRef,
+    ) -> Result<[MemId; SURFACE_NUM as usize]> {
         let mut out_mem_id_array = [core::ptr::null_mut(); SURFACE_NUM as usize];
-        self.err_to_result(unsafe {
-            (self.CrmAllocateD3DSurfacesForIntel)(in_process_ref, out_mem_id_array.as_mut_ptr())
+        sdk_result(unsafe {
+            (self.CrmAllocateD3DSurfacesForIntel)(in_process_ref.as_raw(), out_mem_id_array.as_mut_ptr())
         })?;
         Ok(out_mem_id_array)
     }
 
+    /// # Safety
+    ///
+    /// `in_process_ref` is the live ref `in_mem_id_array` was allocated
+    /// against with [`allocate_d3d_surfaces_for_intel`](Self::allocate_d3d_surfaces_for_intel),
+    /// and the surfaces are not freed already.
     #[cfg(target_os = "windows")]
     #[inline]
-    pub fn deallocate_d3d_surfaces_for_intel(&self, in_process_ref: ProcessRef, in_mem_id_array: &[MemId; SURFACE_NUM as usize]) -> Result<()> {
-        self.err_to_result(unsafe {
-            (self.CrmDeallocateD3DSurfacesForIntel)(in_process_ref, in_mem_id_array.as_ptr() as MemId)
+    pub unsafe fn deallocate_d3d_surfaces_for_intel(
+        &self,
+        in_process_ref: ProcessRef,
+        in_mem_id_array: &[MemId; SURFACE_NUM as usize],
+    ) -> Result<()> {
+        sdk_result(unsafe {
+            (self.CrmDeallocateD3DSurfacesForIntel)(in_process_ref.as_raw(), in_mem_id_array.as_ptr() as MemId)
         })
     }
 
+    /// # Safety
+    ///
+    /// `in_process_ref` is a live ref from [`create_process_ref`](Self::create_process_ref)
+    /// on this library.
     #[cfg(target_os = "windows")]
     #[inline]
-    pub fn create_device_handle_for_intel(
+    pub unsafe fn create_device_handle_for_intel(
         &self,
         in_process_ref: ProcessRef,
         in_mem_type: MemType,
     ) -> Result<DeviceHandle> {
-        let mut out_device_handle = core::mem::MaybeUninit::<DeviceHandle>::uninit();
-        self.err_to_result(unsafe {
-            (self.CrmCreateDeviceHandleForIntel)(in_process_ref, out_device_handle.as_mut_ptr(), in_mem_type)
+        let mut out_device_handle: DeviceHandle = core::ptr::null_mut();
+        sdk_result(unsafe {
+            (self.CrmCreateDeviceHandleForIntel)(in_process_ref.as_raw(), &mut out_device_handle, in_mem_type)
         })?;
-        Ok(unsafe { out_device_handle.assume_init() })
+        Ok(out_device_handle)
     }
 
+    /// # Safety
+    ///
+    /// `in_process_ref` is a live ref from [`create_process_ref`](Self::create_process_ref)
+    /// on this library.
     #[cfg(target_os = "windows")]
     #[inline]
-    pub fn cleanup_device_handle_for_intel(&self, in_process_ref: ProcessRef) -> Result<()> {
-        self.err_to_result(unsafe { (self.CrmCleanupDeviceHandleForIntel)(in_process_ref) })
+    pub unsafe fn cleanup_device_handle_for_intel(&self, in_process_ref: ProcessRef) -> Result<()> {
+        sdk_result(unsafe { (self.CrmCleanupDeviceHandleForIntel)(in_process_ref.as_raw()) })
     }
 
-    /// Pre-process step before [`get_image_with_gpu_memory`](Self::get_image_with_gpu_memory).
+    /* ── Deprecated GPU-memory path (spec § 7.3.4 – 7.3.5) ─────────────────────────────────────── */
+
+    /// Pre-process step before [`get_image_with_gpu_memory`](Self::get_image_with_gpu_memory)
+    /// (deprecated in the spec, OpenCL only). Returns the size in bytes of the
+    /// GPU output buffer the caller must allocate.
     ///
-    /// Returns the size in bytes of the GPU output buffer the caller
-    /// must allocate. The caller passes a representative compressed
-    /// frame so the SDK can size its internal scratch + the output
-    /// buffer for the active `(dev_param, res_param)` shape.
+    /// # Safety
     ///
-    /// Typed surface: takes `&[u8]` for the source buffer, `&mut`
-    /// for the `DevParamV13` / `ResParamV13` parameter structs (the SDK
-    /// reserves the right to mutate them during pre-process — e.g. to
-    /// normalise `bytes_per_line` against the resolved output width),
-    /// and the strongly-typed `SampleSequence` enum.
+    /// `in_process_ref` is a live ref from [`create_process_ref`](Self::create_process_ref)
+    /// on this library.
     #[inline]
-    pub fn pre_process_for_get_image_with_gpu_memory(
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn pre_process_for_get_image_with_gpu_memory(
         &self,
         in_process_ref: ProcessRef,
         in_bits_per_sample: CrmUInt32,
@@ -2168,29 +2798,36 @@ impl CrmSdkLibrary {
         in_bytes_per_line: CrmUInt32,
         in_sample_sequence: SampleSequence,
         in_src_buffer: &[u8],
-        in_dev_param: &mut DevParamV13,
-        in_res_param: &mut ResParamV13,
+        in_dev_param: &DevParamV13,
+        in_res_param: &ResParamV13,
     ) -> Result<CrmUInt32> {
         let mut out_required_buffer_size = 0;
-        self.err_to_result(unsafe {
+        sdk_result(unsafe {
             (self.CrmPreProcessForGetImageWithGpuMemory)(
-                in_process_ref,
+                in_process_ref.as_raw(),
                 in_bits_per_sample,
                 in_samples_per_pixel,
                 in_bytes_per_line,
                 in_sample_sequence as CrmUInt32,
                 in_src_buffer.as_ptr() as *mut CrmVoid,
                 in_src_buffer.len() as CrmUInt32,
-                in_dev_param  as *mut _ as *mut CrmVoid,
-                in_res_param  as *mut _ as *mut CrmVoid,
+                in_dev_param as *const _ as *mut CrmVoid,
+                in_res_param as *const _ as *mut CrmVoid,
                 &mut out_required_buffer_size,
             )
         })?;
         Ok(out_required_buffer_size)
     }
 
+    /// # Safety
+    ///
+    /// `in_process_ref` is a live ref prepared by
+    /// [`pre_process_for_get_image_with_gpu_memory`](Self::pre_process_for_get_image_with_gpu_memory);
+    /// `in_src_buffer` and `out_dst_buffer` are OpenCL buffers of at least
+    /// `in_src_data_size` and the pre-processed size respectively, valid until
+    /// the SDK's queue has been finished.
     #[inline]
-    pub fn get_image_with_gpu_memory(
+    pub unsafe fn get_image_with_gpu_memory(
         &self,
         in_process_ref: ProcessRef,
         out_dst_buffer: *mut CrmVoid,
@@ -2199,9 +2836,9 @@ impl CrmSdkLibrary {
         in_src_data_size: CrmUInt32,
     ) -> Result<CrmUInt32> {
         let mut out_dst_data_size = 0;
-        self.err_to_result(unsafe {
+        sdk_result(unsafe {
             (self.CrmGetImageWithGpuMemory)(
-                in_process_ref,
+                in_process_ref.as_raw(),
                 out_dst_buffer,
                 in_dst_buffer_size,
                 &mut out_dst_data_size,
@@ -2212,32 +2849,27 @@ impl CrmSdkLibrary {
         Ok(out_dst_data_size)
     }
 
-    #[inline]
-    fn get_last_error(&self, out_error_msg: *mut CrmChar, in_buffer_size: CrmUInt32) -> Result<()> {
-        self.err_to_result(unsafe { (self.CrmGetLastError)(out_error_msg, in_buffer_size) })
-    }
+    /* ── Utilities ────────────────────────────────────────────────────────────────────────────── */
 
-    /// Convenience helper (still uses `CrmGetLastError` under the hood).
+    /// The SDK's detail message for the last error (`CrmGetLastError`).
     pub fn get_last_error_string(&self) -> Result<String> {
-        use std::ffi::CStr;
-
         let mut buf = vec![0u8; 8192];
-        self.get_last_error(buf.as_mut_ptr() as *mut CrmChar, buf.len() as CrmUInt32)?;
-
-        let cstr = unsafe { CStr::from_ptr(buf.as_ptr() as *const CrmChar) };
-        Ok(cstr.to_string_lossy().into_owned())
+        sdk_result(unsafe { (self.CrmGetLastError)(buf.as_mut_ptr().cast(), buf.len() as CrmUInt32) })?;
+        Ok(fixed_ascii(&buf))
     }
 
     #[inline]
-    pub fn get_out_image_size(
-        &self,
-        in_res_param: &ResParamV13,
-        header_bufer: &[u8],
-    ) -> Result<(u32, u32)> {
+    pub fn get_out_image_size(&self, in_res_param: &ResParamV13, header_buffer: &[u8]) -> Result<(u32, u32)> {
         let mut out_image_width = 0;
         let mut out_image_height = 0;
-        self.err_to_result(unsafe {
-            (self.CrmGetOutImageSize)(in_res_param as *const _ as *mut _, &mut out_image_width, &mut out_image_height, header_bufer.as_ptr() as *mut _, header_bufer.len() as CrmUInt32)
+        sdk_result(unsafe {
+            (self.CrmGetOutImageSize)(
+                in_res_param as *const _ as *mut _,
+                &mut out_image_width,
+                &mut out_image_height,
+                header_buffer.as_ptr() as *mut _,
+                header_buffer.len() as CrmUInt32,
+            )
         })?;
         Ok((out_image_width, out_image_height))
     }
@@ -2247,7 +2879,7 @@ impl CrmSdkLibrary {
     /// header pack per frame, prefer `_into` against an owned scratch
     /// buffer — repeated calls steady into one growth then stay.
     #[inline]
-    pub fn create_header_pack(&self, header_array: &[Header]) -> Result<Vec<u8>> {
+    pub fn create_header_pack(&self, header_array: &[Header<'_>]) -> Result<Vec<u8>> {
         let mut buf = Vec::with_capacity(64 * 1024);
         self.create_header_pack_into(header_array, &mut buf)?;
         Ok(buf)
@@ -2255,20 +2887,22 @@ impl CrmSdkLibrary {
 
     /// Build the SDK header pack for `header_array` into `dst`.
     ///
-    /// Starts with a 64 KB working buffer (real header packs are
-    /// kilobytes; the prior shape allocated `MAX_FILE_SIZE = 28 MB`
-    /// per call) and retries with the SDK-reported size if the SDK
-    /// reports the initial buffer is too small. On success `dst` is
-    /// truncated to the exact output size.
-    pub fn create_header_pack_into(&self, header_array: &[Header], dst: &mut Vec<u8>) -> Result<()> {
-        if dst.capacity() == 0 { dst.reserve(64 * 1024); }
+    /// Starts with a 64 KB working buffer (real header packs are a few
+    /// kilobytes, far below the SDK's `MAX_FILE_SIZE` of 28 MB) and
+    /// retries with the SDK-reported size if the SDK reports the initial
+    /// buffer is too small. On success `dst` is truncated to the exact
+    /// output size.
+    pub fn create_header_pack_into(&self, header_array: &[Header<'_>], dst: &mut Vec<u8>) -> Result<()> {
+        if dst.capacity() == 0 {
+            dst.reserve(64 * 1024);
+        }
         dst.clear();
         dst.resize(dst.capacity(), 0);
 
         let mut out_size: CrmUInt32 = 0;
         let first = unsafe {
             (self.CrmCreateHeaderPack)(
-                header_array.as_ptr() as *mut _,
+                header_array.as_ptr(),
                 header_array.len() as CrmUInt32,
                 dst.as_mut_ptr() as *mut CrmVoid,
                 dst.len() as CrmUInt32,
@@ -2276,13 +2910,13 @@ impl CrmSdkLibrary {
             )
         };
 
-        if first != SdkError::Ok && (out_size as usize) > dst.len() {
+        if first != CRM_ERR_OK && (out_size as usize) > dst.len() {
             // SDK reported a larger required size — grow and retry once.
             dst.clear();
             dst.resize(out_size as usize, 0);
-            self.err_to_result(unsafe {
+            sdk_result(unsafe {
                 (self.CrmCreateHeaderPack)(
-                    header_array.as_ptr() as *mut _,
+                    header_array.as_ptr(),
                     header_array.len() as CrmUInt32,
                     dst.as_mut_ptr() as *mut CrmVoid,
                     dst.len() as CrmUInt32,
@@ -2290,7 +2924,7 @@ impl CrmSdkLibrary {
                 )
             })?;
         } else {
-            self.err_to_result(first)?;
+            sdk_result(first)?;
         }
         dst.truncate(out_size as usize);
         Ok(())
@@ -2316,7 +2950,7 @@ impl CrmSdkLibrary {
     ///
     /// The SDK does not validate `path`. Pointing it at a directory with no
     /// `CanonLUTs` in it — or at a path that does not exist at all — still
-    /// returns [`SdkError::Ok`], and leaves whatever LUTs were loaded before
+    /// returns `CRM_ERR_OK`, and leaves whatever LUTs were loaded before
     /// (normally the `CrmInitializeSDK*` default) in force. An `Ok` here is
     /// therefore NOT evidence that the LUTs were found; a caller that needs
     /// them must check `path.join("CanonLUTs")` itself. The mistake surfaces
@@ -2329,20 +2963,9 @@ impl CrmSdkLibrary {
     #[inline]
     pub fn set_luts_directory(&self, path: impl AsRef<Path>, is_absolute_path: bool) -> Result<()> {
         let c_path = sdk_path_cstring(path.as_ref())?;
-        self.err_to_result(unsafe { (self.CrmSetLUTsDirectory)(c_path.as_ptr() as *const CrmChar, is_absolute_path as CrmBool) })
-    }
-
-    fn err_to_result(&self, err: SdkError) -> Result<()> {
-        if err == SdkError::Ok {
-            Ok(())
-        } else {
-            // Lazy-format error strings: do NOT call `get_last_error_string`
-            // here (it `vec![0u8; 8192]`-allocates per non-Ok return — and
-            // `DevelopEmptyQueue`/`WaitTimeoutError` are normal flow control
-            // that hammer the allocator). Callers that want the SDK's
-            // detail string call `get_last_error_string()` themselves.
-            Err(CrmError::SdkError(err))
-        }
+        sdk_result(unsafe {
+            (self.CrmSetLUTsDirectory)(c_path.as_ptr() as *const CrmChar, is_absolute_path as CrmBool)
+        })
     }
 }
 
@@ -2355,17 +2978,27 @@ impl Drop for CrmSdkLibrary {
 /// Owned device/CPU memory allocation from the CRM SDK. The `Arc<CrmSdkLibrary>`
 /// keeps the SDK deallocator symbol alive for the life of the allocation —
 /// no lifetime parameter, so the value moves cleanly into long-lived carriers
-/// (e.g. an `Arc<BackendFrameAnchor>` in gpu-video).
+/// such as a frame handle that outlives the decode call.
 pub struct CrmMemory {
-    ptr:    *mut CrmVoid,
+    ptr: *mut CrmVoid,
     device: Device,
-    size:   CrmUInt32,
-    sdk:    Arc<CrmSdkLibrary>,
+    size: CrmUInt32,
+    sdk: Arc<CrmSdkLibrary>,
 }
 // CrmMemory — Send only. Plain device (or aligned CPU) memory; the
 // `Arc<CrmSdkLibrary>` keeps the deallocator symbol alive for the life of
 // the allocation. Single-owner GPU/CPU buffer → not `Sync`.
 unsafe impl Send for CrmMemory {}
+
+impl std::fmt::Debug for CrmMemory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CrmMemory")
+            .field("ptr", &self.ptr)
+            .field("device", &self.device)
+            .field("size", &self.size)
+            .finish_non_exhaustive()
+    }
+}
 
 impl CrmMemory {
     pub fn new(sdk: Arc<CrmSdkLibrary>, size: CrmUInt32, device: Device) -> Result<Self> {
@@ -2385,13 +3018,18 @@ impl CrmMemory {
         self.size as usize
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.size == 0
+    }
+
     pub fn device(&self) -> Device {
         self.device
     }
 }
 impl Drop for CrmMemory {
     fn drop(&mut self) {
-        // ignore error
-        let _ = self.sdk.deallocate(self.ptr, self.device);
+        // SAFETY: `ptr` came from `allocate` with `device` on this library and
+        // is freed only here. A failure has nowhere to go from `Drop`.
+        let _ = unsafe { self.sdk.deallocate(self.ptr, self.device) };
     }
 }

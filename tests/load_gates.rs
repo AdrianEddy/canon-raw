@@ -1,37 +1,34 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Which [`CrmError`] shape [`CrmMovie::load`]'s **SDK-lane header gates**
+//! Which [`CrmError`] shape [`CrmMovie::load`]'s **SDK-path header gates**
 //! report — and why exactly one of them may say "damaged".
 //!
-//! `oxivideo::decoder::crm::container_error` reads this crate's error enum as a
-//! two-class verdict:
+//! The error enum carries a two-class verdict for callers that try several
+//! decoders in turn:
 //!
-//! | `CrmError`                        | `CrmFault`    | what the user is told                |
-//! |-----------------------------------|---------------|--------------------------------------|
-//! | `MissingData`                     | `Unsupported` | DECLINE → `Configuration`; the dispatcher falls through to the pure-Rust `crm-oxiraw` lane |
-//! | `InvalidFormat` / `InvalidLength` | `Integrity`   | on a `crx `-branded carrier: **`Fatal` — "your clip is corrupt"**, and the open STOPS |
+//! | `CrmError`                        | meaning | what a caller does |
+//! |-----------------------------------|---------|--------------------|
+//! | `MissingData`                     | decline — this decode path cannot serve the file | fall through to the next backend |
+//! | `InvalidFormat` / `InvalidLength` | damage — the container does not resolve | report a corrupt file and stop |
 //!
-//! [`CrmMovie::load`]'s gates are all **lane requirements** — the Canon `uuid`
-//! box, a non-empty video index, and a timed-metadata track that is
-//! index-parallel with the video track — that the shared container parser and
-//! the oxiraw lane do without. None of them is evidence of damage, so every one
-//! of them must land in the first row.
-//!
-//! The defect this file pins: the **count-mismatch** gate raised `InvalidFormat`.
-//! A readable `.CRM` whose timed-metadata sample count was one off the video
-//! frame count was therefore reported to the user as a CORRUPT FILE, and the
-//! `Fatal` class also denied it the oxiraw lane that had no such requirement.
+//! [`CrmMovie::load`]'s gates are all **SDK-path requirements** — the Canon
+//! `uuid` box, a non-empty video index, and a timed-metadata track that is
+//! index-parallel with the video track — that `crm-container` and pure-Rust
+//! decoders can do without. None of them is evidence of damage, so every one of
+//! them must land in the first row. In particular a readable `.CRM` whose
+//! timed-metadata sample count is one off its video frame count must decline,
+//! not be reported as corrupt.
 //!
 //! Synthetic containers, deliberately: each case isolates exactly one deviation
-//! (no real clip does), and they need neither `CrmSdk.dll` nor the multi-hundred-MB
-//! dev corpus. `crm_container::CrmContainer` has the mirror-image suite in
-//! `crm-container/tests/error_classification.rs`; this one covers the SDK glue's
-//! own gates, which live only here.
+//! (no real clip does), and they need neither `CrmSdk` nor sample footage.
+//! `crm_container::CrmContainer` has the mirror-image suite in
+//! `crm-container/tests/error_classification.rs`; this one covers the gates that
+//! live only in `CrmMovie`.
 
 use std::io::Cursor;
 
-use canon_raw::crm_parser::CrmMovie;
 use canon_raw::CrmError;
+use canon_raw::crm_parser::CrmMovie;
 use crm_container::CANON_METADATA_BOX_UUID;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -152,7 +149,7 @@ fn trak(handler: &[u8; 4], sample_entry: Vec<u8>, samples: u32, sample_size: u32
     bx(b"trak", &mdia)
 }
 
-/// Which pieces the synthetic SDK-lane movie carries.
+/// Which pieces the synthetic movie carries.
 #[derive(Clone, Copy)]
 struct Shape {
     video_samples: u32,
@@ -197,21 +194,18 @@ fn movie(shape: Shape) -> Vec<u8> {
 }
 
 fn load_err(shape: Shape) -> CrmError {
-    CrmMovie::load(Cursor::new(movie(shape))).err().expect("this shape must not load")
+    CrmMovie::load(Cursor::new(movie(shape))).expect_err("this shape must not load")
 }
 
 /// The assertion every decline case makes: a `MissingData`, and specifically
-/// NOT one of the two shapes `container_error` escalates to `Fatal`.
+/// NOT one of the two damage shapes.
 #[track_caller]
 fn assert_declines(e: &CrmError, what: &str) {
-    assert!(
-        matches!(e, CrmError::MissingData(_)),
-        "{what} must DECLINE (CrmError::MissingData → CrmFault::Unsupported → Configuration), got {e:?}"
-    );
+    assert!(matches!(e, CrmError::MissingData(_)), "{what} must DECLINE (CrmError::MissingData), got {e:?}");
     assert!(
         !matches!(e, CrmError::InvalidFormat(_) | CrmError::InvalidLength { .. }),
-        "{what} must never travel on a damage shape — those become a Fatal \"your clip is corrupt\" \
-         verdict on a `crx `-branded carrier and stop the dispatcher falling through to crm-oxiraw"
+        "{what} must never travel on a damage shape — those tell the caller the clip is corrupt and \
+         stop it from trying another decoder"
     );
 }
 
@@ -220,21 +214,21 @@ fn assert_declines(e: &CrmError, what: &str) {
 /// The builder is load-bearing: the DEFAULT shape must actually load, or every
 /// "deviation X ⇒ error Y" case below would pass for the wrong reason.
 #[test]
-fn the_complete_synthetic_sdk_lane_movie_loads() {
-    let m = CrmMovie::load(Cursor::new(movie(Shape::default()))).expect("the complete SDK-lane shape parses");
+fn the_complete_synthetic_movie_loads() {
+    let m = CrmMovie::load(Cursor::new(movie(Shape::default()))).expect("the complete shape parses");
     assert_eq!(m.frame_count(), 3, "video samples");
     assert_eq!(m.timed_meta_count(), 3, "timed-metadata samples");
     assert!(m.canon_metadata_box().is_some(), "Canon uuid box present");
     assert_eq!(&m.craw_entry()[4..8], b"CRAW", "craw_entry is the full CRAW box");
 }
 
-/// **The regression.** A timed-metadata track that is not index-parallel with
-/// the video track breaks an SDK-LANE requirement — `timed_meta[frame_no]` per
-/// video frame — that the oxiraw lane does not have. Declining lets the
-/// dispatcher play the clip; reporting damage (what `InvalidFormat` did here)
-/// both libelled an intact file and terminated the open.
+/// A timed-metadata track that is not index-parallel with the video track
+/// breaks an SDK-path requirement — `timed_meta[frame_no]` per video frame —
+/// that other decoders do not have. Declining lets the caller play the clip
+/// elsewhere; reporting damage would both condemn an intact file and end the
+/// open.
 ///
-/// Both directions, because the SDK lane needs the tracks index-parallel, not
+/// Both directions, because the SDK path needs the tracks index-parallel, not
 /// merely long enough: a metadata track with SPARE samples is no more usable
 /// per-frame than a short one.
 #[test]
@@ -245,11 +239,10 @@ fn a_timed_metadata_count_mismatch_declines_rather_than_reporting_damage() {
     }
 }
 
-/// The sibling gates were already declines; they are pinned here so the whole
-/// gate block is covered by one contract rather than one of four being right by
-/// accident.
+/// The sibling gates are pinned too, so the whole gate block is covered by one
+/// contract rather than one of four being right by accident.
 #[test]
-fn the_other_sdk_lane_header_gates_decline_too() {
+fn the_other_header_gates_decline_too() {
     assert_declines(
         &load_err(Shape { with_canon_uuid: false, ..Shape::default() }),
         "a container with no Canon `uuid` metadata box",
@@ -264,16 +257,15 @@ fn the_other_sdk_lane_header_gates_decline_too() {
     );
 }
 
-/// The control that keeps the fix honest: moving the count-mismatch gate off
-/// `InvalidFormat` must NOT have turned genuine container damage into a silent
-/// decline. A sample table `mp4-atom` cannot decode is `CrmContainerError::Parse`
-/// — the ONE shape `map_err` still routes to `InvalidFormat`, and hence the one
-/// that still reaches `CrmFault::Integrity`.
+/// The control: declining on lane requirements must NOT turn genuine container
+/// damage into a silent decline. A sample table `mp4-atom` cannot decode is
+/// `CrmContainerError::Parse` — the ONE container error that maps to
+/// `InvalidFormat`.
 #[test]
 fn a_corrupt_sample_table_is_still_reported_as_damage() {
     let e = load_err(Shape { corrupt_video_stsz: true, ..Shape::default() });
     assert!(
         matches!(e, CrmError::InvalidFormat(_)),
-        "a `stsz` that does not decode is DAMAGE (CrmError::InvalidFormat → CrmFault::Integrity), got {e:?}"
+        "a `stsz` that does not decode is DAMAGE (CrmError::InvalidFormat), got {e:?}"
     );
 }

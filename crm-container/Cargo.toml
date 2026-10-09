@@ -1,0 +1,27 @@
+[package]
+name = "crm-container"
+version = "0.2.1"
+description = "Pure-Rust parser for the Canon Cinema RAW Light (.CRM) ISOBMFF container"
+documentation = "https://docs.rs/crm-container"
+readme = "README.md"
+keywords = ["canon", "cinema-raw", "crm", "isobmff", "mp4"]
+categories = ["parser-implementations", "multimedia::video"]
+include = [
+    "/src",
+    "/tests",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE-MIT",
+    "/LICENSE-Apache-2.0",
+]
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+mp4-atom = "0.16.2"
+
+[lints]
+workspace = true
