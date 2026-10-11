@@ -857,13 +857,17 @@ mod cf {
 
     impl Retained {
         /// A one-element `NSArray` holding (and retaining) `object`; null for null.
-        pub(super) fn array_of_one(object: *mut c_void) -> Self {
+        ///
+        /// # Safety
+        /// `object` must be null or a live CoreFoundation / Objective-C object.
+        pub(super) unsafe fn array_of_one(object: *mut c_void) -> Self {
             if object.is_null() {
                 return Self(core::ptr::null());
             }
             let values = [object as *const c_void];
-            // SAFETY: one valid element; `kCFTypeArrayCallBacks` retains it for
-            // the array's lifetime. The create rule hands over the one reference.
+            // SAFETY: one live element, per the contract; `kCFTypeArrayCallBacks`
+            // retains it for the array's lifetime. The create rule hands over the
+            // one reference.
             Self(unsafe { CFArrayCreate(core::ptr::null(), values.as_ptr(), 1, &raw const kCFTypeArrayCallBacks as _) })
         }
 
@@ -908,14 +912,22 @@ unsafe impl Send for CrmMetalInit {}
 impl CrmMetalInit {
     /// `device` is an `id<MTLDevice>`, `command_queue` an `id<MTLCommandQueue>`
     /// on it (or null, for queues of the SDK's own). Both are retained.
-    pub fn new(device: *mut core::ffi::c_void, command_queue: *mut core::ffi::c_void) -> Self {
+    ///
+    /// # Safety
+    ///
+    /// `device` and `command_queue` must each be null or a live Objective-C
+    /// object: they are retained here, before the SDK ever sees them.
+    /// [`CrmSdkLibrary::initialize_with_metal`] then needs them to be the
+    /// device and queue described above.
+    pub unsafe fn new(device: *mut core::ffi::c_void, command_queue: *mut core::ffi::c_void) -> Self {
         // The SDK takes ARRAYS here (see `MtlObject`). Handed the bare
         // `id<MTLDevice>`, `CrmInitializeSDKWithDevice` sent it an `NSArray`
         // message and threw `NSInvalidArgumentException` (unrecognized
         // selector) out of `+[CrmMtlRawDeveloperObjC CrmMtlGetSystemInfo:
         // mtlObjectRef:]` — through Rust frames, so the process aborted.
-        let devices = cf::Retained::array_of_one(device);
-        let queues = cf::Retained::array_of_one(command_queue);
+        // SAFETY: both are null or live objects, per the contract.
+        let (devices, queues) =
+            unsafe { (cf::Retained::array_of_one(device), cf::Retained::array_of_one(command_queue)) };
         Self {
             raw: MtlObject { device_ids: devices.as_ptr(), device_num: 1, command_queue: queues.as_ptr() },
             _arrays: [devices, queues],

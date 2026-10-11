@@ -42,7 +42,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.120
+      # The version goes in `toolchain`, not the ref: dependabot reads a
+      # `@1.88` ref as an action version and "upgrades" it.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --lib --locked
 
