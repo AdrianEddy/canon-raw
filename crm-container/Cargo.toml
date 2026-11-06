@@ -21,7 +21,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-mp4-atom = "0.16.2"
+mp4-atom = "0.17.0"
 
 [lints]
 workspace = true
