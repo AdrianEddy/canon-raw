@@ -33,8 +33,21 @@
 //! (and its `timed_meta` / `audio` siblings) seeks to the sample offset and
 //! `read_exact`s exactly `size` bytes — one frame in memory, O(1) regardless of
 //! file size.
+//!
+//! ## Damaged and hostile files
+//!
+//! Every size the file states is checked against the file before memory is
+//! allocated for it: a box must end inside its parent (a top-level box inside the
+//! file), a sample table may not declare more samples than the file has room for,
+//! and a sample is read only when it lies inside the file. Buffers sized from the
+//! file are reserved fallibly, so a size that is merely huge comes back as an
+//! [`Io`](CrmContainerError::Io) error of kind `OutOfMemory` rather than aborting
+//! the process. A recording cut short (copied while incomplete, or by a full card)
+//! still loads when its `moov` is intact; [`CrmContainer::readable_frame_count`]
+//! says how many of its frames the file actually holds.
 
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom};
+use std::sync::OnceLock;
 
 use mp4_atom::{Co64, Decode, Stco, Stsc, Stsz, StszSamples, Stts};
 
@@ -154,8 +167,15 @@ pub struct CrmContainer<R> {
     reader: R,
     video_samples: Vec<Sample>,
     timed_meta_samples: Vec<Sample>,
-    /// The `soun` track's per-sample table (empty if no audio track).
-    audio_samples: Vec<Sample>,
+    /// The `soun` track's sample-table box (`stbl`) bytes (empty if no audio
+    /// track). Its per-sample table is built from them on first use
+    /// ([`audio_table`]): at 16 bytes a sample, a long clip's LPCM table runs to
+    /// hundreds of MB, which a reader that never touches the audio (a video
+    /// decoder) should not hold.
+    audio_stbl: Vec<u8>,
+    /// The `soun` track's per-sample table, once built (empty if no audio track,
+    /// or when its tables do not parse: the audio is optional).
+    audio_samples: OnceLock<Vec<Sample>>,
     /// The parsed LPCM audio format (`None` if no audio track / unparseable).
     audio_format: Option<AudioFormat>,
     /// The audio media timescale (`= sample rate`); `0` if no audio track.
@@ -172,6 +192,10 @@ pub struct CrmContainer<R> {
     /// `kCrmHeaderCraw` header. Not optional: [`CrmContainer::load`] cannot get
     /// past [`Cmp1`] without it.
     craw_entry: Vec<u8>,
+    /// The file's length as last seen: at load, and again whenever a sample read
+    /// found a sample past it (a file still being written grows). Every sample is
+    /// checked against it before its bytes are allocated or read.
+    file_len: u64,
 }
 
 impl<R: Read + Seek> CrmContainer<R> {
@@ -210,14 +234,17 @@ impl<R: Read + Seek> CrmContainer<R> {
     ///   `.CRM` that IS a broken file.
     ///
     /// Plus [`CrmContainerError::Io`] when the reader fails — including
-    /// `UnexpectedEof` on a file truncated inside `moov`.
+    /// `UnexpectedEof` on a file truncated inside `moov` (a `moov` whose stated
+    /// size runs past the end of the file), and `OutOfMemory` when the `moov` or a
+    /// sample table is too large to hold.
     pub fn load(mut reader: R) -> Result<Self> {
         let flen = reader.seek(SeekFrom::End(0))?;
 
         // Locate the top-level `moov`, read its BODY into memory (small — the
-        // multi-hundred-MB mdat is never read).
+        // multi-hundred-MB mdat is never read). `top_level_box` only returns a box
+        // that ends inside the file, so the allocation is bounded by the file.
         let moov_span = top_level_box(&mut reader, flen, b"moov")?.ok_or(CrmContainerError::MissingBox("moov"))?;
-        let mut moov_buf = vec![0u8; moov_span.body_len as usize];
+        let mut moov_buf = zeroed_buffer(moov_span.body_len)?;
         reader.seek(SeekFrom::Start(moov_span.body_off))?;
         reader.read_exact(&mut moov_buf)?;
 
@@ -234,21 +261,25 @@ impl<R: Read + Seek> CrmContainer<R> {
         // (`Unsupported`) rather than asserting the file is broken.
         let video_trak = find_track_body(&moov_buf, b"vide")
             .ok_or(CrmContainerError::Unsupported("no video track (handler 'vide')"))?;
-        let video_samples = build_sample_table(video_trak.stbl)?;
+        let video_samples = build_sample_table(video_trak.stbl, flen)?;
         if video_samples.is_empty() {
             return Err(CrmContainerError::Unsupported("video track has zero samples"));
         }
 
         let timed_meta_track = find_track_body(&moov_buf, b"meta");
         let timed_meta_samples =
-            timed_meta_track.as_ref().map(|t| build_sample_table(t.stbl)).transpose()?.unwrap_or_default();
+            timed_meta_track.as_ref().map(|t| build_sample_table(t.stbl, flen)).transpose()?.unwrap_or_default();
 
         // Audio (`soun`) track — Canon's CRM SDK exposes zero audio, so the
         // uncompressed LPCM track is surfaced here from the container. Tolerant:
         // a malformed / unparseable audio track never fails the container load.
         let audio_track = find_track_body(&moov_buf, b"soun");
-        let audio_samples =
-            audio_track.as_ref().map(|t| build_sample_table(t.stbl).unwrap_or_default()).unwrap_or_default();
+        // A copy of a part of the moov buffer, reserved fallibly like it.
+        let mut audio_stbl = Vec::new();
+        if let Some(t) = audio_track.as_ref() {
+            audio_stbl = zeroed_buffer(t.stbl.len() as u64)?;
+            audio_stbl.copy_from_slice(t.stbl);
+        }
         let audio_format = audio_track.as_ref().and_then(|t| parse_audio_format(t.stbl));
         let audio_timescale = audio_track.as_ref().map(|t| t.timescale).unwrap_or(0);
 
@@ -282,7 +313,8 @@ impl<R: Read + Seek> CrmContainer<R> {
             reader,
             video_samples,
             timed_meta_samples,
-            audio_samples,
+            audio_stbl,
+            audio_samples: OnceLock::new(),
             audio_format,
             audio_timescale,
             cmp1,
@@ -290,6 +322,7 @@ impl<R: Read + Seek> CrmContainer<R> {
             fps,
             canon_uuid_box,
             craw_entry,
+            file_len: flen,
         })
     }
 
@@ -311,6 +344,31 @@ impl<R: Read + Seek> CrmContainer<R> {
     /// Number of timed-metadata samples (may differ from [`Self::frame_count`]).
     pub fn timed_meta_count(&self) -> u64 {
         self.timed_meta_samples.len() as u64
+    }
+
+    /// Number of leading video frames the file actually holds: frames `0..n` whose
+    /// compressed sample lies wholly inside the file and — when the movie has a
+    /// timed-metadata track — whose timed-metadata sample exists and lies inside
+    /// the file too.
+    ///
+    /// Equal to [`frame_count`](Self::frame_count) for an intact clip whose
+    /// timed-metadata track is index-parallel with its video. Smaller for a
+    /// recording cut short (a copy taken while it was still being written, a full
+    /// card, a partial transfer), whose `moov` still describes every frame
+    /// recorded, and for a timed-metadata track with fewer samples than the video.
+    /// A decoder that plays up to this count reaches its end instead of failing on
+    /// the first missing frame.
+    ///
+    /// Measured against the file length seen at [`load`](Self::load), or later by
+    /// a sample read that found the file had grown. O(frames), no I/O.
+    pub fn readable_frame_count(&self) -> u64 {
+        let in_file = |s: &Sample| s.offset.checked_add(u64::from(s.size)).is_some_and(|end| end <= self.file_len);
+        let has_meta = !self.timed_meta_samples.is_empty();
+        self.video_samples
+            .iter()
+            .enumerate()
+            .take_while(|&(i, v)| in_file(v) && (!has_meta || self.timed_meta_samples.get(i).is_some_and(in_file)))
+            .count() as u64
     }
 
     /// The parsed `CMP1` CRX geometry / codec parameters.
@@ -364,32 +422,65 @@ impl<R: Read + Seek> CrmContainer<R> {
     }
 
     /// Read the compressed video frame at `frame_no` into a fresh buffer.
+    ///
+    /// # Errors
+    ///
+    /// [`FrameOutOfRange`](CrmContainerError::FrameOutOfRange) past the table;
+    /// [`Io`](CrmContainerError::Io) `UnexpectedEof` when the sample runs past the
+    /// end of the file (checked before anything is allocated), `OutOfMemory` when
+    /// its buffer can't be had.
     pub fn read_compressed_frame(&mut self, frame_no: u64) -> Result<Vec<u8>> {
-        let size = self.compressed_frame_size(frame_no)? as usize;
-        let mut buf = vec![0u8; size];
-        let n = read_sample_into(&mut self.reader, &self.video_samples, frame_no, &mut buf)?;
+        let s = sample_at(&self.video_samples, frame_no)?;
+        ensure_in_file(&mut self.reader, &mut self.file_len, s, "video frame", frame_no)?;
+        let mut buf = zeroed_buffer(u64::from(s.size))?;
+        let n = read_sample_into(
+            &mut self.reader,
+            &mut self.file_len,
+            &self.video_samples,
+            "video frame",
+            frame_no,
+            &mut buf,
+        )?;
         buf.truncate(n);
         Ok(buf)
     }
 
-    /// Read the timed-metadata sample at `frame_no` into a fresh buffer.
+    /// Read the timed-metadata sample at `frame_no` into a fresh buffer. Errors as
+    /// [`read_compressed_frame`](Self::read_compressed_frame).
     pub fn read_timed_meta(&mut self, frame_no: u64) -> Result<Vec<u8>> {
-        let size = self.timed_meta_size(frame_no)? as usize;
-        let mut buf = vec![0u8; size];
-        let n = read_sample_into(&mut self.reader, &self.timed_meta_samples, frame_no, &mut buf)?;
+        let s = sample_at(&self.timed_meta_samples, frame_no)?;
+        ensure_in_file(&mut self.reader, &mut self.file_len, s, "timed-metadata sample", frame_no)?;
+        let mut buf = zeroed_buffer(u64::from(s.size))?;
+        let n = read_sample_into(
+            &mut self.reader,
+            &mut self.file_len,
+            &self.timed_meta_samples,
+            "timed-metadata sample",
+            frame_no,
+            &mut buf,
+        )?;
         buf.truncate(n);
         Ok(buf)
     }
 
     /// Read the compressed video frame at `frame_no` into the caller-owned `dst`.
-    /// Returns the bytes written (always the sample size on success).
+    /// Returns the bytes written (always the sample size on success). A sample
+    /// past the end of the file is an [`Io`](CrmContainerError::Io)
+    /// `UnexpectedEof`, before anything is read.
     pub fn read_compressed_frame_into(&mut self, frame_no: u64, dst: &mut [u8]) -> Result<usize> {
-        read_sample_into(&mut self.reader, &self.video_samples, frame_no, dst)
+        read_sample_into(&mut self.reader, &mut self.file_len, &self.video_samples, "video frame", frame_no, dst)
     }
 
     /// Read the timed-metadata sample at `frame_no` into the caller-owned `dst`.
     pub fn read_timed_meta_into(&mut self, frame_no: u64, dst: &mut [u8]) -> Result<usize> {
-        read_sample_into(&mut self.reader, &self.timed_meta_samples, frame_no, dst)
+        read_sample_into(
+            &mut self.reader,
+            &mut self.file_len,
+            &self.timed_meta_samples,
+            "timed-metadata sample",
+            frame_no,
+            dst,
+        )
     }
 
     /// The uncompressed-LPCM audio format, or `None` when the container has no
@@ -401,7 +492,7 @@ impl<R: Read + Seek> CrmContainer<R> {
 
     /// Number of audio samples (LPCM sample-table entries; `0` if no audio).
     pub fn audio_sample_count(&self) -> usize {
-        self.audio_samples.len()
+        audio_table(&self.audio_samples, &self.audio_stbl, self.file_len).len()
     }
 
     /// The audio media timescale (equals the LPCM sample rate); `0` if no audio.
@@ -412,9 +503,12 @@ impl<R: Read + Seek> CrmContainer<R> {
     /// Read the audio sample at `index` into the caller-owned `buf` (resized to
     /// the sample size). Returns the bytes written.
     pub fn read_audio_sample_into(&mut self, index: usize, buf: &mut Vec<u8>) -> Result<usize> {
-        let size = sample_size(&self.audio_samples, index as u64)? as usize;
-        buf.resize(size, 0);
-        read_sample_into(&mut self.reader, &self.audio_samples, index as u64, buf)
+        let table = audio_table(&self.audio_samples, &self.audio_stbl, self.file_len);
+        let s = sample_at(table, index as u64)?;
+        ensure_in_file(&mut self.reader, &mut self.file_len, s, "audio sample", index as u64)?;
+        buf.clear();
+        grow_zeroed(buf, u64::from(s.size))?;
+        read_sample_into(&mut self.reader, &mut self.file_len, table, "audio sample", index as u64, buf)
     }
 
     /// Read a **contiguous run** of `count` audio samples starting at `start`
@@ -437,14 +531,12 @@ impl<R: Read + Seek> CrmContainer<R> {
         if count == 0 {
             return Ok(0);
         }
+        let table = audio_table(&self.audio_samples, &self.audio_stbl, self.file_len);
         let end = start
             .checked_add(count)
-            .ok_or(CrmContainerError::FrameOutOfRange { index: u64::MAX, count: self.audio_samples.len() as u64 })?;
-        if end > self.audio_samples.len() {
-            return Err(CrmContainerError::FrameOutOfRange {
-                index: end as u64 - 1,
-                count: self.audio_samples.len() as u64,
-            });
+            .ok_or(CrmContainerError::FrameOutOfRange { index: u64::MAX, count: table.len() as u64 })?;
+        if end > table.len() {
+            return Err(CrmContainerError::FrameOutOfRange { index: end as u64 - 1, count: table.len() as u64 });
         }
 
         let mut total = 0usize;
@@ -452,16 +544,20 @@ impl<R: Read + Seek> CrmContainer<R> {
         while i < end {
             // Extend the run while the next sample sits immediately after the
             // current span in the file.
-            let run_off = self.audio_samples[i].offset;
-            let mut run_len = self.audio_samples[i].size as u64;
+            let run_off = table[i].offset;
+            let mut run_len = table[i].size as u64;
             let mut j = i + 1;
-            while j < end && self.audio_samples[j].offset == run_off + run_len {
-                run_len += self.audio_samples[j].size as u64;
+            while j < end && run_off.checked_add(run_len) == Some(table[j].offset) {
+                run_len += table[j].size as u64;
                 j += 1;
             }
-            let span = run_len as usize;
+            // The whole run must lie inside the file before its bytes are allocated:
+            // a run is at most `count` table entries, but each entry's size is the
+            // file's word.
+            check_span_in_file(&mut self.reader, &mut self.file_len, run_off, run_len, "audio samples", i as u64)?;
             let at = buf.len();
-            buf.resize(at + span, 0);
+            grow_zeroed(buf, run_len)?;
+            let span = run_len as usize;
             self.reader.seek(SeekFrom::Start(run_off))?;
             self.reader.read_exact(&mut buf[at..at + span])?;
             total += span;
@@ -499,6 +595,12 @@ struct BoxSpan {
 /// Scan the top-level box list for the first box of `name`, returning its body
 /// span. Reads only 8/16-byte headers, seeking past each box (never reads box
 /// bodies — in particular never reads `mdat`).
+///
+/// Every returned span ends inside the file: a box of `name` whose stated size
+/// runs past the end of the file is an `UnexpectedEof` I/O error (the file was cut
+/// inside it, or the size is garbage — either way its body can't be read, and must
+/// not be allocated for). Another box running past the end ends the scan, since
+/// nothing can follow it.
 fn top_level_box<R: Read + Seek>(reader: &mut R, flen: u64, name: &[u8; 4]) -> Result<Option<BoxSpan>> {
     let mut pos = 0u64;
     while pos.checked_add(8).is_some_and(|end| end <= flen) {
@@ -507,6 +609,13 @@ fn top_level_box<R: Read + Seek>(reader: &mut R, flen: u64, name: &[u8; 4]) -> R
         reader.read_exact(&mut hdr[..8])?;
         let size32 = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
         let typ = [hdr[4], hdr[5], hdr[6], hdr[7]];
+        if size32 == 1 && pos + 16 > flen {
+            // A 64-bit size field cut off by the end of the file.
+            if typ == *name {
+                return Err(past_the_end(name, pos, None, flen));
+            }
+            break;
+        }
         let (body_off, total) = if size32 == 1 {
             reader.read_exact(&mut hdr[8..16])?;
             let size64 = u64::from_be_bytes([hdr[8], hdr[9], hdr[10], hdr[11], hdr[12], hdr[13], hdr[14], hdr[15]]);
@@ -525,12 +634,31 @@ fn top_level_box<R: Read + Seek>(reader: &mut R, flen: u64, name: &[u8; 4]) -> R
         if total < header_len {
             break; // malformed
         }
+        if next_pos > flen {
+            if typ == *name {
+                return Err(past_the_end(name, pos, Some(total), flen));
+            }
+            break;
+        }
         if typ == *name {
             return Ok(Some(BoxSpan { body_off, body_len: total - header_len }));
         }
         pos = next_pos;
     }
     Ok(None)
+}
+
+/// The `UnexpectedEof` for a top-level box the file ends inside of.
+fn past_the_end(name: &[u8; 4], pos: u64, total: Option<u64>, flen: u64) -> CrmContainerError {
+    let what = match total {
+        Some(total) => format!("states {total} bytes"),
+        None => "has its 64-bit size cut off".to_owned(),
+    };
+    io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        format!("the '{}' box at {pos} {what}, past the end of the {flen}-byte file", fourcc_str(name)),
+    )
+    .into()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -578,6 +706,15 @@ fn find_track_body<'a>(moov_body: &'a [u8], handler: &[u8; 4]) -> Option<TrackBo
 /// QuickTime-flavoured entries don't reject the whole tree). Reads the v0
 /// AudioSampleEntry fields; endianness derives from the fourcc. Returns `None`
 /// (skip audio) on any structural problem.
+/// The audio track's per-sample table from its `stbl` bytes, built on the first
+/// call and kept (empty if there is no audio track or its tables do not parse:
+/// the audio is optional, so a bad audio track never fails a load).
+fn audio_table<'a>(cell: &'a OnceLock<Vec<Sample>>, stbl: &[u8], file_len: u64) -> &'a [Sample] {
+    cell.get_or_init(
+        || if stbl.is_empty() { Vec::new() } else { build_sample_table(stbl, file_len).unwrap_or_default() },
+    )
+}
+
 fn parse_audio_format(stbl: &[u8]) -> Option<AudioFormat> {
     // `stsd` body: version/flags(4) + entry_count(4), then the sample entries.
     // The first sample entry box begins at offset 8.
@@ -679,45 +816,71 @@ fn fourcc_str(name: &[u8; 4]) -> String {
 /// leaf boxes (`stsz` / `stsc` / `stco`|`co64`), each decoded via `mp4-atom`.
 /// CRM is intra-only with one sample-per-chunk in practice, but the full `stsc`
 /// run-length walk is honoured.
-fn build_sample_table(stbl: &[u8]) -> Result<Vec<Sample>> {
+///
+/// The leaf tables themselves are bounded by their box bytes (`mp4-atom` reads
+/// each entry from the box, so a count larger than the box ends the decode with
+/// an error). The one count that is not is an identical-size `stsz`'s, a bare
+/// `u32` that the table built here would hold 16 bytes per sample of: a track
+/// declaring more samples than `file_len` has 16-byte units is refused as
+/// [`Parse`](CrmContainerError::Parse) (a real track has far fewer — even 16-bit
+/// mono audio takes 2 bytes per sample, and a CRM's video dwarfs its audio), so
+/// the table never takes more memory than the file is long.
+fn build_sample_table(stbl: &[u8], file_len: u64) -> Result<Vec<Sample>> {
     let stsz = decode_leaf::<Stsz>(stbl, b"stsz")?.ok_or(CrmContainerError::MissingBox("stsz (sample sizes)"))?;
     let stsc = decode_leaf::<Stsc>(stbl, b"stsc")?.ok_or(CrmContainerError::MissingBox("stsc (sample-to-chunk)"))?;
     let chunk_offsets = read_chunk_offsets(stbl)?;
 
-    let sample_sizes: Vec<u32> = match &stsz.samples {
-        StszSamples::Identical { count, size } => vec![*size; *count as usize],
-        StszSamples::Different { sizes } => sizes.clone(),
+    let (count, identical): (u64, Option<u32>) = match &stsz.samples {
+        StszSamples::Identical { count, size } => (u64::from(*count), Some(*size)),
+        StszSamples::Different { sizes } => (sizes.len() as u64, None),
     };
+    let max_samples = file_len / std::mem::size_of::<Sample>() as u64;
+    if count > max_samples {
+        return Err(CrmContainerError::Parse(format!(
+            "stsz declares {count} samples, more than a {file_len}-byte file can hold"
+        )));
+    }
+    let sizes: &[u32] = match &stsz.samples {
+        StszSamples::Different { sizes } => sizes,
+        StszSamples::Identical { .. } => &[],
+    };
+    // `i < count`, and `count` is `sizes.len()` whenever the sizes differ.
+    let size_at = |i: usize| identical.unwrap_or_else(|| sizes[i]);
+    let count = count as usize;
 
-    let mut samples = Vec::with_capacity(sample_sizes.len());
+    let mut samples = Vec::new();
+    samples.try_reserve_exact(count).map_err(|e| out_of_memory(format!("a sample table of {count} entries: {e}")))?;
     let mut si = 0usize;
+    // `stsc` runs, walked in step with the chunks (both ascend), so the walk is
+    // O(chunks + runs) whatever the file says.
+    let mut run = 0usize;
+    let mut spc = 1u32;
     for (ci, &chunk_off) in chunk_offsets.iter().enumerate() {
-        let spc = samples_per_chunk((ci + 1) as u32, &stsc);
+        let chunk_1based = (ci as u64 + 1).min(u64::from(u32::MAX)) as u32;
+        while let Some(e) = stsc.entries.get(run) {
+            if e.first_chunk > chunk_1based {
+                break;
+            }
+            spc = e.samples_per_chunk;
+            run += 1;
+        }
         let mut off = chunk_off;
         for _ in 0..spc {
-            let Some(&size) = sample_sizes.get(si) else { break };
+            if si >= count {
+                break;
+            }
+            let size = size_at(si);
             samples.push(Sample { offset: off, size });
-            off += u64::from(size);
+            // A sample past the end of the u64 range is past the end of the file:
+            // it stays unreadable (`readable_frame_count`, the read checks).
+            off = off.saturating_add(u64::from(size));
             si += 1;
         }
-        if si >= sample_sizes.len() {
+        if si >= count {
             break;
         }
     }
     Ok(samples)
-}
-
-/// samples-per-chunk for a 1-based chunk index, per the run-length `stsc` table.
-fn samples_per_chunk(chunk_1based: u32, stsc: &Stsc) -> u32 {
-    let mut spc = 1;
-    for e in &stsc.entries {
-        if e.first_chunk <= chunk_1based {
-            spc = e.samples_per_chunk;
-        } else {
-            break;
-        }
-    }
-    spc
 }
 
 /// Chunk offsets from `co64` (preferred when present) or `stco`, decoded via
@@ -733,23 +896,85 @@ fn read_chunk_offsets(stbl: &[u8]) -> Result<Vec<u64>> {
 }
 
 fn sample_size(index: &[Sample], frame_no: u64) -> Result<u32> {
-    index
-        .get(frame_no as usize)
-        .map(|s| s.size)
+    sample_at(index, frame_no).map(|s| s.size)
+}
+
+fn sample_at(index: &[Sample], frame_no: u64) -> Result<Sample> {
+    usize::try_from(frame_no)
+        .ok()
+        .and_then(|i| index.get(i))
+        .copied()
         .ok_or(CrmContainerError::FrameOutOfRange { index: frame_no, count: index.len() as u64 })
 }
 
-fn read_sample_into<R: Read + Seek>(reader: &mut R, index: &[Sample], frame_no: u64, dst: &mut [u8]) -> Result<usize> {
-    let s = *index
-        .get(frame_no as usize)
-        .ok_or(CrmContainerError::FrameOutOfRange { index: frame_no, count: index.len() as u64 })?;
+fn read_sample_into<R: Read + Seek>(
+    reader: &mut R,
+    file_len: &mut u64,
+    index: &[Sample],
+    what: &str,
+    frame_no: u64,
+    dst: &mut [u8],
+) -> Result<usize> {
+    let s = sample_at(index, frame_no)?;
     let size = s.size as usize;
     if dst.len() < size {
         return Err(CrmContainerError::BufferTooSmall { needed: size, got: dst.len() });
     }
+    ensure_in_file(reader, file_len, s, what, frame_no)?;
     reader.seek(SeekFrom::Start(s.offset))?;
     reader.read_exact(&mut dst[..size])?;
     Ok(size)
+}
+
+/// Check that sample `s` lies wholly inside the file. When it doesn't by the
+/// length known, the file's length is read again once (a file still being written
+/// grows) and kept. A sample past the end is an `UnexpectedEof` I/O error, raised
+/// before anything is allocated or read for it.
+fn ensure_in_file<R: Seek>(reader: &mut R, file_len: &mut u64, s: Sample, what: &str, index: u64) -> Result<()> {
+    check_span_in_file(reader, file_len, s.offset, u64::from(s.size), what, index)
+}
+
+fn check_span_in_file<R: Seek>(
+    reader: &mut R,
+    file_len: &mut u64,
+    offset: u64,
+    len: u64,
+    what: &str,
+    index: u64,
+) -> Result<()> {
+    let end = offset.checked_add(len);
+    if end.is_some_and(|end| end <= *file_len) {
+        return Ok(());
+    }
+    *file_len = reader.seek(SeekFrom::End(0))?;
+    if end.is_some_and(|end| end <= *file_len) {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        format!("{what} {index} ({len} bytes at {offset}) runs past the end of the file ({} bytes)", *file_len),
+    )
+    .into())
+}
+
+/// A zero-filled buffer of `len` bytes, reserved fallibly: a failed allocation is
+/// an `OutOfMemory` I/O error instead of the process abort `vec![0; len]` is.
+fn zeroed_buffer(len: u64) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    grow_zeroed(&mut buf, len)?;
+    Ok(buf)
+}
+
+/// Append `extra` zero bytes to `buf`, reserved fallibly (see [`zeroed_buffer`]).
+fn grow_zeroed(buf: &mut Vec<u8>, extra: u64) -> Result<()> {
+    let extra = usize::try_from(extra).map_err(|_| out_of_memory(format!("{extra} bytes")))?;
+    buf.try_reserve_exact(extra).map_err(|e| out_of_memory(format!("{extra} bytes: {e}")))?;
+    buf.resize(buf.len() + extra, 0);
+    Ok(())
+}
+
+fn out_of_memory(what: String) -> CrmContainerError {
+    io::Error::new(io::ErrorKind::OutOfMemory, format!("cannot allocate {what}")).into()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
